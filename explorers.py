@@ -1,0 +1,182 @@
+# =============================================================================
+# explorers.py - Async token holders fetchers
+# =============================================================================
+import os
+import asyncio
+import aiohttp
+from typing import Optional
+import re
+
+# ----------------------- Async LRU Cache -----------------------
+def async_lru(ttl_seconds: int = 600):
+    """Simple in-process async cache decorator."""
+    def _decorator(func):
+        cache = {}
+        lock = asyncio.Lock()
+
+        async def wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            now = asyncio.get_event_loop().time()
+            async with lock:
+                entry = cache.get(key)
+                if entry:
+                    ts, value = entry
+                    if now - ts < ttl_seconds:
+                        return value
+                value = await func(*args, **kwargs)
+                cache[key] = (now, value)
+                return value
+        return wrapper
+    return _decorator
+
+# ----------------------- Main Function -----------------------
+@async_lru(ttl_seconds=600)
+async def get_holders_by_address(address: str, chain: str) -> Optional[int]:
+    """
+    Return holder count (int) for token contract address on given chain.
+    Supported chains: 'ethereum', 'bsc', 'base', 'solana', 'tron'
+    Returns None if unknown/unavailable.
+    """
+    if not address:
+        return None
+    address = address.strip()
+    chain = (chain or "").lower()
+
+    try:
+        if chain in ("ethereum", "eth"):
+            return await _holders_etherscan(address, explorer="etherscan")
+        if chain in ("bsc", "bnb", "binance"):
+            return await _holders_bscscan(address)
+        if chain == "base":
+            return await _holders_etherscan(address, explorer="basescan")
+        if chain in ("solana", "sol"):
+            return await _holders_solscan(address)
+        if chain == "tron":
+            return await _holders_tronscan(address)
+    except Exception:
+        return None
+
+    return None
+
+# ----------------------- Etherscan / BaseScan helpers -----------------------
+async def _holders_etherscan(address: str, explorer: str = "etherscan") -> Optional[int]:
+    key = None
+    base_url = "https://api.etherscan.io/api"
+    if explorer == "basescan":
+        key = os.getenv("BASESCAN_API_KEY") or os.getenv("ETHERSCAN_API_KEY")
+        base_url = "https://api.basescan.org/api" if os.getenv("BASESCAN_API_KEY") else base_url
+    else:
+        key = os.getenv("ETHERSCAN_API_KEY")
+
+    try:
+        url = f"{base_url}?module=token&action=tokeninfo&contractaddress={address}"
+        if key:
+            url += f"&apikey={key}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=8) as resp:
+                if resp.status == 200:
+                    j = await resp.json()
+                    res = j.get("result")
+                    if isinstance(res, dict):
+                        holders = res.get("holders") or res.get("holderCount") or res.get("holder_count")
+                        if holders:
+                            try:
+                                return int(holders)
+                            except Exception:
+                                pass
+    except Exception:
+        pass
+
+    # Fallback: tokenholderchart page
+    try:
+        base = base_url.split("/api")[0]
+        url = f"{base}/tokenholderchart/{address}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=8) as resp:
+                if resp.status == 200:
+                    txt = await resp.text()
+                    m = re.search(r'"holders"\s*:\s*([0-9,]+)', txt)
+                    if m:
+                        try:
+                            return int(m.group(1).replace(",", ""))
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    return None
+
+# ----------------------- BscScan helpers -----------------------
+async def _holders_bscscan(address: str) -> Optional[int]:
+    key = os.getenv("BSCSCAN_API_KEY")
+    base_url = "https://api.bscscan.com/api"
+
+    try:
+        url = f"{base_url}?module=token&action=tokeninfo&contractaddress={address}"
+        if key:
+            url += f"&apikey={key}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=8) as resp:
+                if resp.status == 200:
+                    j = await resp.json()
+                    res = j.get("result")
+                    if isinstance(res, dict):
+                        holders = res.get("holders") or res.get("holderCount") or res.get("holder_count")
+                        if holders:
+                            try:
+                                return int(holders)
+                            except Exception:
+                                pass
+    except Exception:
+        pass
+
+    # Fallback: scrape BscScan page
+    try:
+        url = f"https://bscscan.com/token/{address}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=8) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    m = re.search(r'Holders</span>\s*<span[^>]*>\s*([0-9,]+)', text)
+                    if m:
+                        return int(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+
+    return None
+
+# ----------------------- SolScan helpers -----------------------
+async def _holders_solscan(address: str) -> Optional[int]:
+    try:
+        url = f"https://public-api.solscan.io/token/meta?tokenAddress={address}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=8) as resp:
+                if resp.status == 200:
+                    j = await resp.json()
+                    holders = j.get("holders") or j.get("holdersCount") or j.get("holderCount")
+                    if holders:
+                        try:
+                            return int(holders)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return None
+
+# ----------------------- Tron: Tronscan helpers -----------------------
+async def _holders_tronscan(address: str) -> Optional[int]:
+    try:
+        url = f"https://apilist.tronscan.org/api/token?id={address}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=8) as resp:
+                if resp.status == 200:
+                    j = await resp.json()
+                    holders = j.get("holders") or j.get("holderCount") or j.get("holder_count")
+                    if holders:
+                        try:
+                            return int(holders)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return None
