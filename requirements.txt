@@ -4,3 +4,5 @@ python-telegram-bot==20.7
 python-dotenv==1.0.0
 kaleido==0.2.1
 playwright==1.47.0
+numpy==1.26.4
+Pillow==10.4.0
