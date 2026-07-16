@@ -249,7 +249,7 @@ class CryptoBotConfig:
         '3d': {'name': '3 Days', 'minutes': 4320},
         '1w': {'name': '1 Week', 'minutes': 10080},
         '2w': {'name': '2 Weeks', 'minutes': 20160},
-        '1m': {'name': '1 Month', 'minutes': 43200}
+        '1M': {'name': '1 Month', 'minutes': 43200}  # '1M' (bukan '1m') — '1m' sudah dipakai 1 Minute
     }
 
     DEXSCREENER_BASE_URL = "https://api.dexscreener.com/latest"
@@ -311,12 +311,14 @@ class CoinMarketCapAPI:
                                     'volume_24h': coin_data.get('usd_24h_vol', 0),
                                     'rank': 1 if coin_info['symbol'] == 'BTC' else 2 if coin_info[
                                                                                             'symbol'] == 'ETH' else 3,
-                                    'emoji_chart': format_custom_emoji(CE['chart'])[0],
-                                    'entities_chart': format_custom_emoji(CE['chart'])[1],
-                                    'emoji_money': format_custom_emoji(CE['money'])[0],
-                                    'entities_money': format_custom_emoji(CE['money'])[1],
-                                    'emoji_rocket': format_custom_emoji(CE['rocket'])[0],
-                                    'entities_rocket': format_custom_emoji(CE['rocket'])[1]
+                                    # format_custom_emoji butuh (text, CE) — pemanggilan lama dengan
+                                    # satu argumen selalu TypeError sehingga fungsi ini selalu return None
+                                    'emoji_chart': CE['chart']['char'],
+                                    'entities_chart': CE['chart']['entities'],
+                                    'emoji_money': CE['money']['char'],
+                                    'entities_money': CE['money']['entities'],
+                                    'emoji_rocket': CE['rocket']['char'],
+                                    'entities_rocket': CE['rocket']['entities']
                                 }
 
             else:
@@ -340,12 +342,12 @@ class CoinMarketCapAPI:
                                 'market_cap': quote['market_cap'],
                                 'volume_24h': quote['volume_24h'],
                                 'rank': coin_data['cmc_rank'],
-                                'emoji_chart': format_custom_emoji(CE['chart'])[0],
-                                'entities_chart': format_custom_emoji(CE['chart'])[1],
-                                'emoji_money': format_custom_emoji(CE['money'])[0],
-                                'entities_money': format_custom_emoji(CE['money'])[1],
-                                'emoji_rocket': format_custom_emoji(CE['rocket'])[0],
-                                'entities_rocket': format_custom_emoji(CE['rocket'])[1]
+                                'emoji_chart': CE['chart']['char'],
+                                'entities_chart': CE['chart']['entities'],
+                                'emoji_money': CE['money']['char'],
+                                'entities_money': CE['money']['entities'],
+                                'emoji_rocket': CE['rocket']['char'],
+                                'entities_rocket': CE['rocket']['entities']
                             }
 
             return None
@@ -1020,7 +1022,7 @@ class CryptoPriceScannerBot:
         token_id: contract address (dex) or coingecko_id (coingecko)
         source: 'dexscreener' or 'coingecko'
         """
-        reports_file = "promo.json"  # changed file name
+        reports_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "promo.json")
         if not os.path.exists(reports_file):
             return ""
 
@@ -1158,8 +1160,10 @@ class CryptoPriceScannerBot:
 
                 pair = results[0]
                 base_token = pair.get('baseToken') or {}
-                symbol = base_token.get('symbol', 'Unknown')
-                name = base_token.get('name', 'Unknown')
+                # escape supaya nama/simbol token meme yang mengandung _ * ` [
+                # tidak bikin Telegram menolak pesan ("Can't parse entities")
+                symbol = escape_markdown(base_token.get('symbol', 'Unknown'), version=1)
+                name = escape_markdown(base_token.get('name', 'Unknown'), version=1)
                 contract = base_token.get('address', 'N/A')
                 chain_id = pair.get('chainId', 'unknown')
                 chain_info = CryptoBotConfig.BLOCKCHAINS.get(chain_id, {'name': '❓ Unknown'})
@@ -1257,11 +1261,21 @@ class CryptoPriceScannerBot:
                     report += f"🔗 Links\n└ " + " • ".join(link_items) + "\n\n"
 
                 # --- Security Section ---
+                # Batasi waktu keseluruhan security check: tanpa timeout,
+                # satu API yang hang (default aiohttp = 300 detik/request)
+                # membuat semua scan macet bermenit-menit.
                 if contract and chain_id:
-                    async with aiohttp.ClientSession() as session:
-                        sec_info = await get_security_info(session, contract, chain_id)
-                        if sec_info:
-                            report += sec_info + "\n\n"
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=10)
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            sec_info = await asyncio.wait_for(
+                                get_security_info(session, contract, chain_id),
+                                timeout=25,
+                            )
+                            if sec_info:
+                                report += sec_info + "\n\n"
+                    except Exception as e:
+                        logger.warning(f"Security info skipped for {contract}: {e}")
 
                 # --- Bot trading links ---
                 bot_trading_links = [
@@ -1358,16 +1372,21 @@ class CryptoPriceScannerBot:
                     timeframe=timeframe
                 )
 
-                # Screenshot chart
-                file_hint = f"{symbol}_{chain_id}_{timeframe}"
-                output_path = f"charts/{file_hint}.png"
+                # Screenshot chart — path absolut supaya tidak tergantung CWD.
+                # Nama file dibuat unik + disanitasi: dengan concurrent_updates,
+                # dua request token yang sama tidak boleh saling timpa/hapus file.
+                safe_symbol = re.sub(r"[^A-Za-z0-9_-]", "_", symbol)[:32]
+                file_hint = f"{safe_symbol}_{chain_id}_{timeframe}_{random.randint(0, 999999)}"
+                charts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "charts")
+                os.makedirs(charts_dir, exist_ok=True)
+                output_path = os.path.join(charts_dir, f"{file_hint}.png")
                 chart_path = await ChartRenderer.screenshot_chart(ds_url, output_path)
 
                 if not chart_path:
                     return f"{CE['cross']['char']} **Failed to capture chart for:** `{symbol}`", "ERROR", ""
 
                 caption = (
-                    f"{CE['chart']['char']} **{symbol} Chart — {timeframe.upper()}** • {chain_info['name']}\n\n"
+                    f"{CE['chart']['char']} **{escape_markdown(symbol, version=1)} Chart — {timeframe.upper()}** • {chain_info['name']}\n\n"
                     f"{CE['money']['char']} **Price:** {price_display}\n"
                     f"{CE['chart_down']['char']} **1H:** {'+' if price_change_1h >= 0 else ''}{price_change_1h:.2f}%\n"
                     f"{CE['chart_up']['char']} **24H:** {'+' if price_change_24h >= 0 else ''}{price_change_24h:.2f}%\n"
@@ -1528,7 +1547,15 @@ async def handle_chart_command(query: str, timeframe: str = "1h") -> Tuple[str, 
         if chart_file_path and os.path.exists(chart_file_path):
             try:
                 from chart_renderer import compress_image  # taruh helper compress di chart_renderer.py
-                chart_file_path = compress_image(chart_file_path)
+                compressed = compress_image(chart_file_path)
+                if compressed != chart_file_path:
+                    # sumber (PNG mentah) tidak dipakai lagi — hapus supaya
+                    # charts/ tidak menumpuk
+                    try:
+                        os.remove(chart_file_path)
+                    except OSError:
+                        pass
+                chart_file_path = compressed
             except Exception as e:
                 logger.warning(f"Chart compression failed: {e}")
 
@@ -1593,25 +1620,23 @@ async def handle_chart_button(token: str, timeframe: str, query, context):
 
             await loading_msg.delete()
 
-            with open(chart_path, "rb") as img:
-
-                await context.bot.send_photo(
-
-                    chat_id=query.message.chat_id,
-
-                    photo=img,
-
-                    caption=caption,
-
-                    parse_mode=ParseMode.MARKDOWN,
-
-                    reply_markup=reply_markup,
-
-                    read_timeout=60,
-
-                    write_timeout=60
-
-                )
+            try:
+                with open(chart_path, "rb") as img:
+                    await context.bot.send_photo(
+                        chat_id=query.message.chat_id,
+                        photo=img,
+                        caption=caption,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=reply_markup,
+                        read_timeout=60,
+                        write_timeout=60
+                    )
+            finally:
+                # file chart sekali pakai — hapus supaya charts/ tidak menumpuk
+                try:
+                    os.remove(chart_path)
+                except OSError:
+                    pass
 
         else:
             await loading_msg.edit_text(

@@ -60,15 +60,29 @@ async def get_custom_report() -> str:
     valid_promos = []
     updated_promos = []
 
-    for promo in data.get("global", []):
-        expiry = datetime.fromisoformat(promo["expiry"])
+    # Fungsi ini dipanggil di akhir SETIAP scan — satu entri promo yang rusak
+    # (expiry bukan ISO format / key hilang / struktur salah) tidak boleh
+    # bikin semua scan error.
+    entries = data.get("global", []) if isinstance(data, dict) else []
+    for promo in entries:
+        try:
+            expiry = datetime.fromisoformat(promo["expiry"])
+            text = promo["text"]
+            if not isinstance(text, str) or not text:
+                raise ValueError("promo 'text' missing or not a string")
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"DEBUG: Skipping malformed promo entry: {e}")
+            continue
         if expiry > now:
-            valid_promos.append(promo["text"])
+            valid_promos.append(text)
             updated_promos.append(promo)
 
     # optional: remove expired promos
-    data["global"] = updated_promos
-    with open(REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        data["global"] = updated_promos
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"DEBUG: Failed to rewrite promo.json: {e}")
 
     return "\n".join(valid_promos)

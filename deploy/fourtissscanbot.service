@@ -1,0 +1,41 @@
+# Systemd unit untuk FourtisScanBot.
+#
+# Tanpa supervisor seperti ini, satu crash (token revoked, OOM kill, SSH
+# session ditutup) membuat bot mati permanen sampai di-restart manual —
+# ini salah satu penyebab utama "bot berhenti".
+#
+# Pemasangan (jalankan sebagai root, sesuaikan path & user):
+#   cp deploy/fourtissscanbot.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now fourtissscanbot
+#
+# Lihat log:  journalctl -u fourtissscanbot -f
+
+[Unit]
+Description=FourtisScanBot Telegram crypto scanner bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# GANTI dengan user non-root di server Anda
+User=botuser
+# GANTI dengan lokasi repo di server Anda
+WorkingDirectory=/opt/fourtissscanbot
+ExecStart=/opt/fourtissscanbot/venv/bin/python telegram_bot.py
+Restart=always
+RestartSec=5
+# Browser Playwright dipakai bersama: install dengan
+#   PLAYWRIGHT_BROWSERS_PATH=/opt/fourtissscanbot/ms-playwright playwright install chromium --with-deps
+# supaya lokasinya sama walau yang meng-install root dan yang menjalankan botuser
+# (default ~/.cache/ms-playwright itu per-user — beda user = chart selalu gagal).
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/fourtissscanbot/ms-playwright
+# Cegah dua instance polling bersamaan (sumber error 409 Conflict)
+# dengan selalu menjalankan lewat systemd, jangan `python telegram_bot.py` manual.
+
+# Batas memori: Chromium untuk render chart bisa makan banyak RAM;
+# lebih baik service di-restart daripada seluruh server kehabisan memori.
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

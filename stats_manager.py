@@ -1,58 +1,109 @@
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 import aiohttp
 import asyncio
 
-STATS_FILE = "stats.json"
-BACKUP_FILE = "stats_backup.json"
+# Semua path di-anchor ke folder repo supaya bot tetap jalan
+# walau dijalankan dari working directory lain (systemd/cron).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATS_FILE = os.path.join(BASE_DIR, "stats.json")
+BACKUP_FILE = os.path.join(BASE_DIR, "stats_backup.json")
 AUTHORIZED_USER = 5231963014  # user yang menerima report
 
-# ================= Stats default =================
-stats = {
-    "total_users": 0,
-    "total_groups": 0,
-    "scans_today": 0,
-    "total_scans": 0,
-    "users": [],
-    "groups": [],
-    "last_reset": None,
-    "scans_by_chain": {
-        "BSC": {"today": 0, "total": 0},
-        "ETHEREUM": {"today": 0, "total": 0},
-        "SOLANA": {"today": 0, "total": 0},
-        "TRON": {"today": 0, "total": 0},
-        "BASE": {"today": 0, "total": 0},
-        "UNKNOWN": {"today": 0, "total": 0}  # Tambahkan ini untuk melacak token yang tidak teridentifikasi
+
+def _default_stats() -> dict:
+    return {
+        "total_users": 0,
+        "total_groups": 0,
+        "scans_today": 0,
+        "total_scans": 0,
+        "users": [],
+        "groups": [],
+        "last_reset": None,
+        "scans_by_chain": {
+            "BSC": {"today": 0, "total": 0},
+            "ETHEREUM": {"today": 0, "total": 0},
+            "SOLANA": {"today": 0, "total": 0},
+            "TRON": {"today": 0, "total": 0},
+            "BASE": {"today": 0, "total": 0},
+            "UNKNOWN": {"today": 0, "total": 0}  # token yang tidak teridentifikasi
+        }
     }
-}
+
+
+# ================= Stats default =================
+stats = _default_stats()
+
+
+def _read_json_file(path: str):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"[WARN] Gagal baca {path}: {e}")
+    return None
 
 
 # ================= Load / Save =================
 def load_stats():
+    """Muat stats dari disk. Tidak boleh pernah raise — file korup tidak
+    boleh mencegah bot untuk start (fallback: backup, lalu default)."""
     global stats
     loaded = False
-    try:
-        if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, "r") as f:
-                stats = json.load(f)
-                loaded = True
-        elif os.path.exists(BACKUP_FILE):
-            with open(BACKUP_FILE, "r") as f:
-                stats = json.load(f)
-                loaded = True
-    except Exception as e:
-        print(f"[WARN] load_stats gagal: {e}")
-        if os.path.exists(BACKUP_FILE):
-            with open(BACKUP_FILE, "r") as f:
-                stats = json.load(f)
-                loaded = True
+
+    data = _read_json_file(STATS_FILE)
+    if data is None:
+        data = _read_json_file(BACKUP_FILE)
+    if data is not None:
+        # merge di atas default supaya key yang hilang tidak bikin KeyError,
+        # lalu koersi tipe: JSON yang valid tapi bertipe salah (mis. "users": null)
+        # tidak boleh lolos — nanti setiap handler crash TypeError.
+        defaults = _default_stats()
+        merged = dict(defaults)
+        merged.update(data)
+        for key, default_val in defaults.items():
+            if key == "last_reset":
+                if merged.get(key) is not None and not isinstance(merged[key], str):
+                    merged[key] = None
+            elif not isinstance(merged.get(key), type(default_val)):
+                merged[key] = default_val
+        # entri per-chain juga harus dict dengan counter angka
+        for chain, entry in list(merged["scans_by_chain"].items()):
+            if not isinstance(entry, dict):
+                merged["scans_by_chain"][chain] = {"today": 0, "total": 0}
+            else:
+                for counter in ("today", "total"):
+                    if not isinstance(entry.get(counter), int):
+                        entry[counter] = 0
+        stats = merged
+        loaded = True
+    else:
+        print("[WARN] stats.json dan backup tidak terbaca — mulai dari default")
+        stats = _default_stats()
 
     # --- Data Migration and Cleanup ---
+    # Seluruh migrasi dibungkus try/except: bentuk data seaneh apa pun tidak
+    # boleh menggagalkan import module (= bot gagal start).
+    try:
+        _migrate_and_normalize(loaded)
+    except Exception as e:
+        print(f"[WARN] Migrasi stats gagal ({e}) — pakai default")
+        stats = _default_stats()
+
+    save_stats()
+
+
+def _migrate_and_normalize(loaded: bool):
+    global stats
     if loaded and "scans_by_chain" in stats:
         cleaned_chains = {}
         for chain, data in stats["scans_by_chain"].items():
-            chain_upper = chain.upper()  # normalize casing
+            chain_upper = str(chain).upper()  # normalize casing
 
             if "ETHEREUM" in chain_upper or chain_upper == "ETH":
                 final_chain = "ETHEREUM"
@@ -91,8 +142,21 @@ def load_stats():
         if chain not in stats["scans_by_chain"]:
             stats["scans_by_chain"][chain] = data
 
-    save_stats()
 
+def _atomic_write_json(path: str, data: dict):
+    """Tulis JSON secara atomik (temp file + os.replace) supaya crash/kill
+    di tengah penulisan tidak pernah meninggalkan file setengah jadi."""
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def save_stats():
@@ -101,10 +165,8 @@ def save_stats():
         print("[WARN] Stats kosong, skip save")
         return
     try:
-        with open(STATS_FILE, "w") as f:
-            json.dump(stats, f, indent=2, sort_keys=True)
-        with open(BACKUP_FILE, "w") as f:
-            json.dump(stats, f, indent=2, sort_keys=True)
+        _atomic_write_json(STATS_FILE, stats)
+        _atomic_write_json(BACKUP_FILE, stats)
     except Exception as e:
         print(f"[WARN] Gagal save stats: {e}")
 
@@ -165,15 +227,21 @@ def track_chat(chat):
     """Tambah chat (user / group) ke database"""
     global stats
     chat_id = chat.id
+    changed = False
     if chat.type in ("group", "supergroup", "channel"):
         if chat_id not in stats["groups"]:
             stats["groups"].append(chat_id)
             stats["total_groups"] += 1
+            changed = True
     else:
         if chat_id not in stats["users"]:
             stats["users"].append(chat_id)
             stats["total_users"] += 1
-    save_stats()
+            changed = True
+    # tulis ke disk hanya saat ada perubahan — fungsi ini dipanggil di awal
+    # SETIAP update, dan ada job periodik 60 detik yang sudah menyimpan rutin
+    if changed:
+        save_stats()
 
 
 async def track_scan(token_address: str = None, chain: str = None):

@@ -10,11 +10,14 @@ from stats_manager import track_scan
 import aiohttp
 
 # -------- CONFIG --------
-DB_PATH = "scans.db"
-TEMPLATES_DIR = "templates"
+# Path di-anchor ke folder repo supaya DB/template/font tetap ketemu
+# walau bot dijalankan dari working directory lain (systemd/cron).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "scans.db")
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 TEMPLATE_FILES = [os.path.join(TEMPLATES_DIR, f"fourtis{i}.jpg") for i in range(1, 6)]
-FONT_PATH = os.path.join("fonts", "Poppins-BoldItalic.ttf")
-FONT_THIN_PATH = os.path.join("fonts", "arial.ttf")
+FONT_PATH = os.path.join(BASE_DIR, "fonts", "Poppins-BoldItalic.ttf")
+FONT_THIN_PATH = os.path.join(BASE_DIR, "fonts", "arial.ttf")
 COLOR_WHITE = (255, 255, 255)
 COLOR_GREY = (180, 180, 180)
 COLOR_GREEN = (0, 180, 80)
@@ -23,7 +26,7 @@ COLOR_CHROME = (192, 192, 192)
 NEON_GREEN_DARK = (0, 255, 100)
 COLOR_RED = (220, 40, 40)
 MAX_ALL_SCANS = 10
-OUT_DIR = "generated_pnl"
+OUT_DIR = os.path.join(BASE_DIR, "generated_pnl")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -234,7 +237,7 @@ def _load_font(size: int, thin: bool = False):
     return ImageFont.load_default()
 
 
-EXO2_FONT_PATH = os.path.join("fonts", "Montserrat-Black.ttf")
+EXO2_FONT_PATH = os.path.join(BASE_DIR, "fonts", "Montserrat-Black.ttf")
 
 
 def _load_exo2_font(size: int):
@@ -261,7 +264,7 @@ def render_pnl_image(template_path: str, token_symbol: Optional[str],
         font_mcap = _load_font(38)
         font_pct = _load_font(135)
         font_meta = _load_font(32, thin=True)
-        font_emoji = ImageFont.truetype(os.path.join("fonts", "seguiemj.ttf"), 32)
+        font_emoji = ImageFont.truetype(os.path.join(BASE_DIR, "fonts", "seguiemj.ttf"), 32)
 
         pad_x = 90
         block_spacing = 40
@@ -471,19 +474,26 @@ async def pnl_command(update, context):
             await loading.edit_text("❌ Could not fetch current MCAP for the token/address.")
             return
         template_path = random.choice(TEMPLATE_FILES)
-        out_path = render_pnl_image(template_path, token_symbol or cur_sym or token_query,
-                                    float(mcap_at_scan or 0.0), float(current_mcap), username, scanned_at_dt,
-                                    token_query)
+        # Render Pillow itu CPU-bound → jalankan di thread supaya event loop
+        # (dan semua user lain) tidak ikut membeku.
+        out_path = await asyncio.to_thread(
+            render_pnl_image, template_path, token_symbol or cur_sym or token_query,
+            float(mcap_at_scan or 0.0), float(current_mcap), username, scanned_at_dt,
+            token_query)
         if not out_path:
             await loading.edit_text("❌ Failed to render image (missing template?).")
             return
         await loading.delete()
-        with open(out_path, "rb") as fh:
-            await update.message.reply_photo(photo=fh)
         try:
-            os.remove(out_path)
-        except:
-            pass
+            with open(out_path, "rb") as fh:
+                await update.message.reply_photo(photo=fh)
+        finally:
+            # hapus juga saat pengiriman gagal, supaya generated_pnl/ tidak
+            # menumpuk sampai disk penuh
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
     except Exception as e:
         await loading.edit_text(f"❌ Error generating PNL image: {e}")
 

@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Union
 from collections import defaultdict
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.helpers import escape_markdown
 import aiohttp
 import numpy as np
@@ -36,7 +37,7 @@ def escape_number_for_markdown(number: Union[int, float]) -> str:
 
 
 # FUNGSI DATABASE & UTILITAS
-DB_PATH = "scans.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scans.db")
 
 
 def list_scans_for_leaderboard(since_date: datetime, chat_id: int):
@@ -250,13 +251,19 @@ async def leaderboard_command(update, context):
         message = await get_leaderboard_message(period, context, update)
         keyboard = get_leaderboard_keyboard(period)
 
-        await context.bot.edit_message_text(
-            chat_id=query.message.chat_id,
-            message_id=query.message.message_id,
-            text=message,
-            reply_markup=keyboard,
-            parse_mode='MarkdownV2'
-        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                text=message,
+                reply_markup=keyboard,
+                parse_mode='MarkdownV2'
+            )
+        except BadRequest as e:
+            # user menekan periode yang sedang aktif → konten tidak berubah dan
+            # Telegram menolak dengan "Message is not modified"; bukan error nyata
+            if "message is not modified" not in str(e).lower():
+                raise
     else:
         period = '1D'
         message = await get_leaderboard_message(period, context, update)
