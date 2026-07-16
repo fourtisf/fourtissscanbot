@@ -2,7 +2,17 @@ import os
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+
+def _env_int(name: str, default: int) -> int:
+    """int(os.getenv(...)) mentah crash saat variabel di-set tapi kosong
+    (mis. 'PORT=' di .env) — bot gagal start hanya karena satu baris kosong."""
+    value = os.getenv(name)
+    try:
+        return int(value) if value and value.strip() else default
+    except ValueError:
+        return default
 
 
 class Config:
@@ -104,18 +114,18 @@ class Config:
     }
 
     # Bot Settings
-    MAX_TOKENS_PER_CHAIN = int(os.getenv('MAX_TOKENS_PER_CHAIN', 3))
+    MAX_TOKENS_PER_CHAIN = _env_int('MAX_TOKENS_PER_CHAIN', 3)
     DEFAULT_TIMEFRAME = os.getenv('DEFAULT_TIMEFRAME', '1h')
-    CHART_WIDTH = int(os.getenv('CHART_WIDTH', 1000))
-    CHART_HEIGHT = int(os.getenv('CHART_HEIGHT', 600))
+    CHART_WIDTH = _env_int('CHART_WIDTH', 1000)
+    CHART_HEIGHT = _env_int('CHART_HEIGHT', 600)
 
     # Rate Limiting
-    REQUESTS_PER_MINUTE = int(os.getenv('REQUESTS_PER_MINUTE', 60))
-    CACHE_DURATION = int(os.getenv('CACHE_DURATION', 300))  # 5 minutes
+    REQUESTS_PER_MINUTE = _env_int('REQUESTS_PER_MINUTE', 60)
+    CACHE_DURATION = _env_int('CACHE_DURATION', 300)  # 5 minutes
 
     # Webhook Settings (for production)
     WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
-    PORT = int(os.getenv('PORT', 8443))
+    PORT = _env_int('PORT', 8443)
 
 
 # Animated emojis for ALL users (no premium restrictions)

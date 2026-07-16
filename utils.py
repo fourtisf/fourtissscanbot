@@ -12,8 +12,15 @@ def format_custom_emoji(text: str, CE: dict):
 
     for match in re.finditer(r"{(.*?)}", text):
         name = match.group(1)
-        emoji_char = CE.get(name, {}).get("char", "")
-        emoji_id = CE.get(name, {}).get("id")  # Telegram custom emoji ID
+        info = CE.get(name, {})
+        emoji_char = info.get("char", "")
+        # ID emoji disimpan di entities[0]["custom_emoji_id"] (struktur Config),
+        # bukan di key "id" — dukung dua-duanya
+        emoji_id = info.get("id")
+        if not emoji_id:
+            ents = info.get("entities") or []
+            if ents and isinstance(ents[0], dict):
+                emoji_id = ents[0].get("custom_emoji_id")
         start = match.start() + offset
         end = match.end() + offset
 

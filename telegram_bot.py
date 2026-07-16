@@ -41,8 +41,9 @@ def emoji(name: str, default: str = '💠') -> str:
     return CE.get(name, {}).get('char', default)
 
 
-# Load environment variables
-load_dotenv()
+# Load environment variables — path eksplisit supaya .env tetap ketemu
+# walau bot dijalankan dari working directory lain (systemd/cron)
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # Configure logging
 logging.basicConfig(
@@ -86,9 +87,13 @@ class TelegramCryptoBot:
         load_stats()
 
         # Build application
-        self.application = ApplicationBuilder().token(token).request(
+        # concurrent_updates(True): tanpa ini PTB memproses update satu per satu,
+        # sehingga satu request chart (±40-100 detik render Playwright) membuat
+        # SEMUA user lain tidak dijawab — gejala "bot berhenti/macet".
+        self.application = ApplicationBuilder().token(token).concurrent_updates(True).request(
             HTTPXRequest(
-                connection_pool_size=10,
+                connection_pool_size=50,
+                pool_timeout=10.0,
                 read_timeout=20.0,
                 connect_timeout=20.0,
                 write_timeout=20.0
@@ -100,11 +105,16 @@ class TelegramCryptoBot:
 
         # === JOBS ===
 
-        # 1️⃣ Broadcast stats ke semua user/group tiap 2 menit (testing)
+        # 1️⃣ Laporan status "Fourtis LIVE" ke channel report.
+        #    Interval & jeda awal bisa diatur lewat .env:
+        #      REPORT_INTERVAL_SEC (default 43200 = 12 jam)
+        #      REPORT_FIRST_SEC    (default 20 detik setelah start)
+        report_interval = int(os.getenv("REPORT_INTERVAL_SEC", "43200"))
+        report_first = int(os.getenv("REPORT_FIRST_SEC", "20"))
         self.application.job_queue.run_repeating(
             self.broadcast_stats_job,
-            interval=43200,  # 2 menit testing, ganti 43200 = 12 jam produksi
-            first=10,
+            interval=report_interval,
+            first=report_first,
             name="broadcast_stats_job"
         )
 
@@ -222,12 +232,54 @@ class TelegramCryptoBot:
     ##admin_report_manager = AdminReportManager(admin_ids=admin_ids)
     # ADMINS = [123456789, 987654321]
 
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler — tanpa ini exception handler hanya jadi log
+        'No error handlers are registered' dan user tidak dapat respon apa pun."""
+        err = context.error
+        if isinstance(err, telegram.error.Conflict):
+            # Ada consumer getUpdates lain: instance kedua bot, atau token bocor
+            # dipakai orang lain. Bot terlihat hidup tapi tidak menerima update.
+            logger.critical(
+                "409 CONFLICT: ada getUpdates lain yang memakai token ini! "
+                "Pastikan hanya SATU instance bot yang jalan, dan kalau token pernah "
+                "bocor segera revoke via @BotFather. Bot tidak akan menerima update "
+                "selama konflik berlangsung."
+            )
+            return
+        logger.error("Unhandled exception while processing update:", exc_info=err)
+        try:
+            if isinstance(update, Update) and update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="❌ An internal error occurred. Please try again.",
+                )
+        except Exception:
+            pass
+
+    # Simpan referensi background task: tanpa ini asyncio hanya memegang weak
+    # reference dan task bisa di-garbage-collect sebelum selesai (scan hilang).
+    _background_tasks: set = set()
+
+    def spawn_background(self, coro, name: str = "bg-task"):
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _done(t: asyncio.Task):
+            self._background_tasks.discard(t)
+            if not t.cancelled() and t.exception():
+                logger.error(f"Background task '{name}' failed:", exc_info=t.exception())
+
+        task.add_done_callback(_done)
+        return task
+
     def setup_handlers(self):
         """Setup command and callback handlers"""
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
 
         # telegram_bot.py (inside TelegramCryptoBot.__init__ or setup_handlers)
         self.admin_report_manager = AdminReportManager(admin_ids=[1322401802, 7176469093])
+
+        self.application.add_error_handler(self.error_handler)
 
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
@@ -332,27 +384,45 @@ class TelegramCryptoBot:
 
     async def broadcast_stats_job(self, context):
         """
-        Kirim status terbaru ke user tertentu (5231963014)
+        Kirim laporan status "Fourtis LIVE" ke channel report dan/atau admin.
+
+        Target diatur lewat .env:
+          REPORT_CHANNEL_ID = @FourtisScan  (username publik) atau -1001234567890 (id numerik)
+          REPORT_ADMIN_ID   = 5231963014    (opsional, DM admin; default tetap dikirim)
+        Bot HARUS jadi admin channel dengan izin "Post Messages".
         """
         from stats_manager import get_status_message, load_stats
 
         # pastikan stats ter-load
         load_stats()
-
-        # hanya kirim ke user tertentu
-        AUTHORIZED_USER = 5231963014
         message = get_status_message()
 
-        try:
-            await context.bot.send_message(
-                chat_id=AUTHORIZED_USER,
-                text=message,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            logger.info(f"✅ Status message sent to {AUTHORIZED_USER}")
-        except Exception as e:
-            logger.error(f"❌ Failed to send status message to {AUTHORIZED_USER}: {e}")
+        # Kumpulkan target (channel + admin), buang yang kosong / duplikat
+        targets = []
+        channel = os.getenv("REPORT_CHANNEL_ID", "").strip()
+        if channel:
+            # id numerik channel berbentuk -100..., konversi ke int; username biarkan string
+            targets.append(int(channel) if channel.lstrip("-").isdigit() else channel)
+
+        admin = os.getenv("REPORT_ADMIN_ID", "5231963014").strip()
+        if admin:
+            targets.append(int(admin) if admin.lstrip("-").isdigit() else admin)
+
+        if not targets:
+            logger.warning("broadcast_stats_job: tidak ada REPORT_CHANNEL_ID/REPORT_ADMIN_ID yang di-set")
+            return
+
+        for chat_id in dict.fromkeys(targets):  # dedup, jaga urutan
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                logger.info(f"✅ Status report terkirim ke {chat_id}")
+            except Exception as e:
+                logger.error(f"❌ Gagal kirim status ke {chat_id}: {e}")
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # === tracking stats ===
@@ -469,8 +539,11 @@ class TelegramCryptoBot:
         """
 
         # === Tracking stats ===
+        # Catatan: track_scan TIDAK dipanggil di handler-level — penghitungan
+        # scan (dengan chain yang benar) sudah terjadi di search_token_price
+        # (main.py) dan process_and_save_scan (pnl_manager.py); memanggilnya
+        # di sini menghitung ganda.
         track_chat(update.effective_chat)
-        track_scan()
 
         # === Config emojis ===
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
@@ -543,7 +616,7 @@ class TelegramCryptoBot:
                     except Exception as e:
                         logger.error(f"❌ Error in auto-save scan: {e}", exc_info=True)
 
-                asyncio.create_task(_auto_save_price_scan())
+                self.spawn_background(_auto_save_price_scan(), name="auto_save_price_scan")
             except Exception:
                 pass
 
@@ -593,7 +666,6 @@ class TelegramCryptoBot:
     async def chart_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /c command with chart generation (image + details + inline keyboard)."""
         track_chat(update.effective_chat)
-        track_scan()
 
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
 
@@ -667,27 +739,24 @@ class TelegramCryptoBot:
 
             elif chart_type == "DEX_CHART" and chart_path:
 
-                # Compress dulu sebelum kirim
-
-                from chart_renderer import compress_image
-
-                compressed_path = compress_image(chart_path)
-
+                # chart_path sudah dikompres oleh handle_chart_command —
+                # tidak perlu (dan jangan) dikompres ulang di sini.
                 await loading_msg.delete()
 
-                with open(compressed_path, "rb") as photo_file:
-
-                    await update.message.reply_photo(
-
-                        photo=photo_file,
-
-                        caption=caption,
-
-                        parse_mode=ParseMode.MARKDOWN,
-
-                        reply_markup=reply_markup,
-
-                    )
+                try:
+                    with open(chart_path, "rb") as photo_file:
+                        await update.message.reply_photo(
+                            photo=photo_file,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=reply_markup,
+                        )
+                finally:
+                    # hapus file chart sekali pakai supaya disk tidak penuh
+                    try:
+                        os.remove(chart_path)
+                    except OSError:
+                        pass
             else:
                 # Fallback if something unexpected
                 await loading_msg.edit_text(
@@ -715,7 +784,6 @@ class TelegramCryptoBot:
     async def timeframe_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle commands like /1h, /4h with safe Markdown and chart generation."""
         track_chat(update.effective_chat)
-        track_scan()
 
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
 
@@ -741,7 +809,6 @@ class TelegramCryptoBot:
     ):
         """Generate chart for a specific timeframe with safe Markdown and emojis."""
         track_chat(update.effective_chat)
-        track_scan()
 
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
 
@@ -777,16 +844,21 @@ class TelegramCryptoBot:
     """
 
             if chart_path:
-                from chart_renderer import compress_image
-                compressed_path = compress_image(chart_path)
-
+                # chart_path sudah dikompres oleh handle_chart_command
                 await loading_msg.delete()
-                await update.message.reply_photo(
-                    photo=open(compressed_path, "rb"),
-                    caption=chart_message,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=reply_markup
-                )
+                try:
+                    with open(chart_path, "rb") as photo_file:
+                        await update.message.reply_photo(
+                            photo=photo_file,
+                            caption=chart_message,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=reply_markup
+                        )
+                finally:
+                    try:
+                        os.remove(chart_path)
+                    except OSError:
+                        pass
 
             else:
                 # Otherwise just edit text
@@ -876,8 +948,11 @@ class TelegramCryptoBot:
                 ])
             )
 
-            # Simpan hasil scan ke stats_manager
-            asyncio.create_task(process_and_save_scan(update, context, final_query))
+            # Simpan hasil scan ke stats_manager (dengan referensi + logging error)
+            self.spawn_background(
+                process_and_save_scan(update, context, final_query),
+                name="process_and_save_scan",
+            )
 
         except BadRequest as e:
             await update.message.reply_text(
@@ -894,7 +969,6 @@ class TelegramCryptoBot:
 
     async def fear_index_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         track_chat(update.effective_chat)
-        track_scan()
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
         chart_emoji = CE.get('chart', {}).get('char', '📊')
         repeat = CE.get('repeat', {}).get('char', '🔄')
@@ -962,7 +1036,6 @@ class TelegramCryptoBot:
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline button callbacks with charts, price info, fear index, etc."""
         track_chat(update.effective_chat)
-        track_scan()
 
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
 
@@ -1022,7 +1095,10 @@ class TelegramCryptoBot:
                     # inisialisasi bot helper untuk cek major coin
                     scanner_bot = CryptoPriceScannerBot()
 
-                    report = await handle_price_command(token)
+                    # handle_price_command mengembalikan tuple 3 elemen — dulu
+                    # tuple utuh dikirim sebagai teks pesan sehingga tombol
+                    # Refresh SELALU error.
+                    report, final_query, detected_chain = await handle_price_command(token)
 
                     # Build keyboard
                     keyboard = []
@@ -1206,11 +1282,16 @@ class TelegramCryptoBot:
 
 # Example usage
 if __name__ == "__main__":
+    import sys
+
     BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_TELEGRAM_BOT_TOKEN_HERE')
     if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or not BOT_TOKEN:
         print("❌ Please set your Telegram bot token in the .env file")
         print("📱 Get your token from @BotFather on Telegram")
         print("💡 Add TELEGRAM_BOT_TOKEN=your_token_here to your .env file")
+        # exit code != 0 supaya supervisor (systemd) tahu bot GAGAL start,
+        # bukan diam-diam "sukses" lalu mati
+        sys.exit(1)
     else:
         bot = TelegramCryptoBot(BOT_TOKEN)
         bot.run()

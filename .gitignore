@@ -1,5 +1,6 @@
 # Ignore Python virtual environment
 venv/
+.venv/
 
 # Byte-compiled / cache files
 __pycache__/
@@ -9,3 +10,16 @@ __pycache__/
 # System files
 .DS_Store
 Thumbs.db
+
+# SECRETS — jangan pernah commit token/API key.
+# Token bot pernah bocor lewat file ini dan harus di-rotate; simpan .env
+# hanya di server, gunakan .env.example sebagai template.
+.env
+
+# Runtime state & artefak — dibuat/diubah bot saat berjalan, bukan source code
+scans.db
+scans.db-journal
+stats.json
+stats_backup.json
+charts/
+generated_pnl/

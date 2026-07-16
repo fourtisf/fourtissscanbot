@@ -1,10 +1,15 @@
 import os
+import asyncio
 import logging
 from PIL import Image
 import aiohttp
 from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
+
+# Batasi jumlah Chromium yang jalan bersamaan — tiap instance makan ratusan MB
+# RAM; tanpa batas ini beberapa request chart bersamaan bisa memicu OOM kill.
+_RENDER_SEMAPHORE = asyncio.Semaphore(2)
 
 
 def compress_image(path: str, max_size_kb: int = 250) -> str:
@@ -13,6 +18,11 @@ def compress_image(path: str, max_size_kb: int = 250) -> str:
     Return path file hasil kompres.
     """
     try:
+        # Kalau sudah hasil kompresan, jangan dikompres ulang (mencegah file
+        # *_compressed_compressed.jpg menumpuk di disk).
+        if path.endswith("_compressed.jpg"):
+            return path
+
         img = Image.open(path).convert("RGB")
         quality = 90
         output_path = path.rsplit(".", 1)[0] + "_compressed.jpg"
@@ -101,57 +111,68 @@ class ChartRenderer:
         - compress ke JPEG <= max_size_kb
         """
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+            if os.path.dirname(output_path):
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-                    viewport={"width": 1920, "height": 1080},
-                    accept_downloads=False
-                )
+            async with _RENDER_SEMAPHORE:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    try:
+                        context = await browser.new_context(
+                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+                            viewport={"width": 1920, "height": 1080},
+                            accept_downloads=False
+                        )
 
-                page = await context.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                logger.info("⏳ Tunggu 35 detik supaya live chart render...")
-                await page.wait_for_timeout(35000)
+                        page = await context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        logger.info("⏳ Tunggu 35 detik supaya live chart render...")
+                        await page.wait_for_timeout(35000)
 
-                # cari canvas terbesar
-                biggest = None
-                max_area = 0
-                for frame in page.frames:
-                    canvases = frame.locator("canvas")
-                    count = await canvases.count()
-                    for i in range(count):
-                        box = await canvases.nth(i).bounding_box()
-                        if box:
-                            area = box["width"] * box["height"]
-                            if area > max_area:
-                                max_area = area
-                                biggest = canvases.nth(i)
+                        # cari canvas terbesar
+                        biggest = None
+                        max_area = 0
+                        for frame in page.frames:
+                            canvases = frame.locator("canvas")
+                            count = await canvases.count()
+                            for i in range(count):
+                                box = await canvases.nth(i).bounding_box()
+                                if box:
+                                    area = box["width"] * box["height"]
+                                    if area > max_area:
+                                        max_area = area
+                                        biggest = canvases.nth(i)
 
-                if biggest:
-                    await biggest.screenshot(path=output_path)
-                    logger.info(f"📸 Canvas terbesar screenshot → {output_path}")
-                else:
-                    logger.warning("⚠️ Tidak bisa temukan canvas, fallback full screenshot")
-                    await page.screenshot(path=output_path, full_page=True)
+                        if biggest:
+                            await biggest.screenshot(path=output_path)
+                            logger.info(f"📸 Canvas terbesar screenshot → {output_path}")
+                        else:
+                            logger.warning("⚠️ Tidak bisa temukan canvas, fallback full screenshot")
+                            await page.screenshot(path=output_path, full_page=True)
+                    finally:
+                        # tanpa finally, exception (timeout goto/screenshot) akan
+                        # meninggalkan Chromium zombie → lama-lama OOM kill
+                        await browser.close()
 
-                await browser.close()
+            # compress hasil di thread — loop PIL ini CPU-bound
+            output_jpeg = await asyncio.to_thread(compress_image, output_path, max_size_kb)
+            if output_jpeg == output_path:
+                # kompresi gagal → pakai PNG asli apa adanya
+                return output_path
 
-            # compress hasil
-            img = Image.open(output_path).convert("RGB")
-            quality = 90
-            output_jpeg = output_path.rsplit(".", 1)[0] + "_compressed.jpg"
-            while True:
-                img.save(output_jpeg, "JPEG", quality=quality, optimize=True)
-                size_kb = os.path.getsize(output_jpeg) / 1024
-                if size_kb <= max_size_kb or quality <= 20:
-                    break
-                quality -= 10
-
-            logger.info(f"Chart compressed → {int(size_kb)} KB: {output_jpeg}")
+            # PNG mentah tidak dipakai lagi — hapus supaya disk tidak penuh
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
             return output_jpeg
 
         except Exception as e:
             logger.error(f"Screenshot error: {e}")
+            # jangan tinggalkan PNG setengah jadi di charts/ saat gagal
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except OSError:
+                pass
             return ""
