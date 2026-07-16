@@ -105,11 +105,16 @@ class TelegramCryptoBot:
 
         # === JOBS ===
 
-        # 1️⃣ Broadcast stats ke semua user/group tiap 2 menit (testing)
+        # 1️⃣ Laporan status "Fourtis LIVE" ke channel report.
+        #    Interval & jeda awal bisa diatur lewat .env:
+        #      REPORT_INTERVAL_SEC (default 43200 = 12 jam)
+        #      REPORT_FIRST_SEC    (default 20 detik setelah start)
+        report_interval = int(os.getenv("REPORT_INTERVAL_SEC", "43200"))
+        report_first = int(os.getenv("REPORT_FIRST_SEC", "20"))
         self.application.job_queue.run_repeating(
             self.broadcast_stats_job,
-            interval=43200,  # 2 menit testing, ganti 43200 = 12 jam produksi
-            first=10,
+            interval=report_interval,
+            first=report_first,
             name="broadcast_stats_job"
         )
 
@@ -379,27 +384,45 @@ class TelegramCryptoBot:
 
     async def broadcast_stats_job(self, context):
         """
-        Kirim status terbaru ke user tertentu (5231963014)
+        Kirim laporan status "Fourtis LIVE" ke channel report dan/atau admin.
+
+        Target diatur lewat .env:
+          REPORT_CHANNEL_ID = @FourtisScan  (username publik) atau -1001234567890 (id numerik)
+          REPORT_ADMIN_ID   = 5231963014    (opsional, DM admin; default tetap dikirim)
+        Bot HARUS jadi admin channel dengan izin "Post Messages".
         """
         from stats_manager import get_status_message, load_stats
 
         # pastikan stats ter-load
         load_stats()
-
-        # hanya kirim ke user tertentu
-        AUTHORIZED_USER = 5231963014
         message = get_status_message()
 
-        try:
-            await context.bot.send_message(
-                chat_id=AUTHORIZED_USER,
-                text=message,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            logger.info(f"✅ Status message sent to {AUTHORIZED_USER}")
-        except Exception as e:
-            logger.error(f"❌ Failed to send status message to {AUTHORIZED_USER}: {e}")
+        # Kumpulkan target (channel + admin), buang yang kosong / duplikat
+        targets = []
+        channel = os.getenv("REPORT_CHANNEL_ID", "").strip()
+        if channel:
+            # id numerik channel berbentuk -100..., konversi ke int; username biarkan string
+            targets.append(int(channel) if channel.lstrip("-").isdigit() else channel)
+
+        admin = os.getenv("REPORT_ADMIN_ID", "5231963014").strip()
+        if admin:
+            targets.append(int(admin) if admin.lstrip("-").isdigit() else admin)
+
+        if not targets:
+            logger.warning("broadcast_stats_job: tidak ada REPORT_CHANNEL_ID/REPORT_ADMIN_ID yang di-set")
+            return
+
+        for chat_id in dict.fromkeys(targets):  # dedup, jaga urutan
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                logger.info(f"✅ Status report terkirim ke {chat_id}")
+            except Exception as e:
+                logger.error(f"❌ Gagal kirim status ke {chat_id}: {e}")
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # === tracking stats ===
