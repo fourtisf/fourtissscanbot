@@ -3,6 +3,8 @@ import json
 import logging
 import asyncio
 import traceback
+import time
+import threading
 from telegram.error import BadRequest, Conflict, NetworkError, TimedOut, RetryAfter, TelegramError
 from datetime import datetime, timezone, time as dt_time
 from globals import admin_manager, ADMIN_IDS
@@ -83,6 +85,9 @@ class TelegramCryptoBot:
         self.token = token
         self.config = CryptoBotConfig()
 
+        # Heartbeat untuk watchdog anti-freeze (lihat _start_watchdog & run()).
+        self._last_heartbeat = time.monotonic()
+
         # Load stats dari file JSON (mengisi module-level stats)
         load_stats()
 
@@ -132,6 +137,47 @@ class TelegramCryptoBot:
             time=dt_time(hour=0, minute=0, tzinfo=timezone.utc),
             name="reset_daily_stats_job"
         )
+
+        # 4️⃣ Heartbeat: update timestamp tiap 15 detik. Kalau event loop
+        # membeku (ada blocking call yang lolos), job ini tidak jalan → timestamp
+        # basi → watchdog thread akan memaksa restart. Ini jaring pengaman
+        # terakhir supaya bot yang "hang tapi proses masih hidup" tetap pulih.
+        async def _heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
+            self._last_heartbeat = time.monotonic()
+
+        self.application.job_queue.run_repeating(
+            _heartbeat_job,
+            interval=15,
+            first=5,
+            name="heartbeat_job"
+        )
+
+    def _start_watchdog(self):
+        """
+        Jalankan thread daemon yang memantau heartbeat event loop.
+        Kalau loop tidak update heartbeat selama WATCHDOG_TIMEOUT detik
+        (berarti bot beku), paksa keluar dengan exit code != 0 supaya
+        supervisor (run_bot.sh / systemd) menjalankan ulang bot.
+        """
+        timeout = int(os.getenv("WATCHDOG_TIMEOUT", "120"))
+        check_every = max(5, timeout // 4)
+
+        def _watch():
+            while True:
+                time.sleep(check_every)
+                age = time.monotonic() - self._last_heartbeat
+                if age > timeout:
+                    logger.critical(
+                        f"🩺 WATCHDOG: event loop beku selama {int(age)}s "
+                        f"(> {timeout}s). Memaksa restart proses..."
+                    )
+                    # os._exit memaksa proses berhenti walau loop beku.
+                    # Supervisor eksternal akan menghidupkan lagi.
+                    os._exit(1)
+
+        t = threading.Thread(target=_watch, name="watchdog", daemon=True)
+        t.start()
+        logger.info(f"🩺 Watchdog aktif (timeout {timeout}s).")
 
     def emoji(self, name, default='💠'):
         return self.config.CUSTOM_EMOJI_IDS.get(name, {}).get('char', default)
@@ -705,7 +751,8 @@ class TelegramCryptoBot:
 
                 from chart_renderer import compress_image
 
-                compressed_path = compress_image(chart_path)
+                # Kompresi gambar (loop re-encode CPU) → di thread agar tidak blok loop
+                compressed_path = await asyncio.to_thread(compress_image, chart_path)
 
                 await loading_msg.delete()
 
@@ -812,15 +859,19 @@ class TelegramCryptoBot:
 
             if chart_path:
                 from chart_renderer import compress_image
-                compressed_path = compress_image(chart_path)
+                # Kompresi di thread agar tidak blok event loop.
+                compressed_path = await asyncio.to_thread(compress_image, chart_path)
 
                 await loading_msg.delete()
-                await update.message.reply_photo(
-                    photo=open(compressed_path, "rb"),
-                    caption=chart_message,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=reply_markup
-                )
+                # Pakai context manager supaya file descriptor selalu ditutup
+                # (sebelumnya open() tanpa 'with' → fd bocor → "Too many open files").
+                with open(compressed_path, "rb") as photo_file:
+                    await update.message.reply_photo(
+                        photo=photo_file,
+                        caption=chart_message,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=reply_markup
+                    )
 
             else:
                 # Otherwise just edit text
@@ -1235,6 +1286,8 @@ class TelegramCryptoBot:
         print("📊 Features: Price tracking, Charts, Contract scanning")
         print("🔗 Supported: ETH, BSC, SOL, BASE, TRX")
         print("💎 Animated emojis for all users!")
+        # Aktifkan watchdog anti-freeze sebelum mulai polling.
+        self._start_watchdog()
         # drop_pending_updates=True: buang antrian update lama saat start ulang,
         #   supaya bot tidak membanjiri diri sendiri memproses backlog setelah
         #   sempat mati (penyebab umum "start lalu langsung mati lagi").

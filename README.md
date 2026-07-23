@@ -17,10 +17,13 @@ ini akar masalahnya dan apa yang sudah diperbaiki:
 | 4 | **Tidak ada error handler global** — error di handler/job bisa lolos dan menghentikan polling. | Ditambah **`add_error_handler`** yang menangkap semua error, mencatat log lengkap, dan tidak membuat bot crash. |
 | 5 | **File `stats.json` ditulis dari 2 tempat sekaligus** (thread background tiap 60 detik + event loop) → bisa crash `dictionary changed size during iteration` / file rusak. | Penulisan dibuat **thread-safe** (lock + snapshot + tulis atomik). |
 | 6 | **`init_db()` bisa gagal saat import** kalau DB terkunci/rusak → seluruh bot gagal start. | `init_db()` dibungkus try/except agar import tidak pernah gagal. |
-| 7 | **Panggilan API tanpa timeout** bisa menggantung → handler seperti "mati". | Ditambah timeout pada jalur scan. |
+| 7 | **Bot BEKU (freeze), bukan crash** — panggilan berat (render gambar, query database, API tanpa timeout) jalan di dalam event loop → semua user tertahan, bot "hidup tapi diam". Auto-restart TIDAK menolong karena proses tidak mati. | **(a)** Semua panggilan berat (SQLite, render PIL, kompresi gambar, baca/tulis file) dipindah ke thread (`asyncio.to_thread`). **(b)** Semua panggilan API diberi **timeout**. **(c)** Ditambah **watchdog**: kalau loop beku > `WATCHDOG_TIMEOUT` detik, proses dipaksa restart. **(d)** Perbaikan **file descriptor bocor** saat kirim chart (mencegah "Too many open files"). |
 
-> Setelah semua perbaikan ini, saat bot mengalami masalah ia akan **pulih
-> sendiri** (auto-restart) dan mencatat penyebabnya di log — bukan diam mati.
+> Setelah semua perbaikan ini, dua mode kegagalan tertutup:
+> - **Crash** (proses mati) → supervisor **menghidupkan ulang** otomatis.
+> - **Freeze** (proses hidup tapi beku) → **watchdog** memaksa restart.
+>
+> Jadi apa pun penyebabnya, bot **pulih sendiri** dan mencatat penyebabnya di log.
 
 ---
 
@@ -78,6 +81,7 @@ Kalau server RAM kecil dan bot pernah kena OOM, atur di `.env`:
 ```
 MAX_CONCURRENT_CHARTS=1     # jumlah chart yang boleh render bersamaan
 CHART_RENDER_WAIT_MS=15000  # lama tunggu chart render (ms)
+WATCHDOG_TIMEOUT=120        # detik; kalau loop beku selebihnya → paksa restart
 ```
 
 ---

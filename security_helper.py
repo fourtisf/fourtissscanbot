@@ -73,6 +73,10 @@ def get_explorer_link(chain: str, address: str) -> str:
 
 async def safe_json(session: aiohttp.ClientSession, method: str, url: str, **kwargs) -> Optional[Dict[str, Any]]:
     """Safe wrapper for API requests, returns JSON data."""
+    # Timeout default per-request: safe_json adalah pintu bagi SEMUA lookup
+    # security. Tanpa timeout, satu API yang menggantung (Helius/RPC/rugcheck)
+    # bisa membekukan seluruh proses scan tanpa batas.
+    kwargs.setdefault("timeout", aiohttp.ClientTimeout(total=12))
     try:
         async with session.request(method, url, **kwargs) as r:
             txt = await r.text()

@@ -38,6 +38,12 @@ from chart_renderer import ChartRenderer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Timeout default untuk SEMUA panggilan HTTP.
+# WAJIB: tanpa timeout, kalau API pihak ketiga menggantung, handler ikut
+# menggantung selamanya → bot terlihat "mati" walau proses masih hidup, dan
+# error handler TIDAK bisa menangani hang seperti ini.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
 
 def detect_query_type(query: str) -> Tuple[str, Optional[str]]:
     """
@@ -287,7 +293,7 @@ class CoinMarketCapAPI:
             # Use CoinGecko if no API key
             if not self.api_key:
                 # ... kode CoinGecko yang sudah ada ...
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                     url = f"https://api.coingecko.com/api/v3/simple/price"
                     params = {
                         'ids': coin_key,
@@ -322,7 +328,7 @@ class CoinMarketCapAPI:
             else:
                 # Use CoinMarketCap API if key available
                 headers = {'X-CMC_PRO_API_KEY': self.api_key}
-                async with aiohttp.ClientSession(headers=headers) as session:
+                async with aiohttp.ClientSession(headers=headers, timeout=HTTP_TIMEOUT) as session:
                     url = f"{self.base_url}/cryptocurrency/quotes/latest"
                     params = {'id': coin_info['cmc_id']}
 
@@ -365,7 +371,7 @@ class CoinMarketCapAPI:
 
         try:
             headers = {'X-CMC_PRO_API_KEY': self.api_key}
-            async with aiohttp.ClientSession(headers=headers) as session:
+            async with aiohttp.ClientSession(headers=headers, timeout=HTTP_TIMEOUT) as session:
                 url = f"{self.base_url}/cryptocurrency/quotes/historical"
                 params = {
                     "id": cmc_id,
@@ -614,7 +620,7 @@ class GeckoTerminalAPI:
         url = f"{self.base_url}/networks/{gecko_chain_id}/pools/{pair_address}/ohlcv/hour?limit=500"
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 async with session.get(url) as response:
                     response.raise_for_status()
                     data = await response.json()
@@ -964,7 +970,7 @@ class CryptoPriceScannerBot:
         """Get Fear & Greed Index using custom emojis"""
         CE = Config.CUSTOM_EMOJI_IDS  # Shortcut to custom emojis
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 async with session.get(CryptoBotConfig.FEAR_GREED_API) as response:
                     if response.status != 200:
                         logger.error(f"Fear & Greed API returned status {response.status}")
@@ -1056,7 +1062,7 @@ class CryptoPriceScannerBot:
             coingecko_id = major_coin_data["coingecko_id"]
             detected_chain = "ETHEREUM"  # Asumsi major coins ada di ETH untuk tracking
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 url = (
                     f"https://api.coingecko.com/api/v3/coins/{coingecko_id}"
                     "?localization=false&tickers=false&market_data=true&community_data=false"
@@ -1258,7 +1264,7 @@ class CryptoPriceScannerBot:
 
                 # --- Security Section ---
                 if contract and chain_id:
-                    async with aiohttp.ClientSession() as session:
+                    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                         sec_info = await get_security_info(session, contract, chain_id)
                         if sec_info:
                             report += sec_info + "\n\n"
@@ -1528,7 +1534,7 @@ async def handle_chart_command(query: str, timeframe: str = "1h") -> Tuple[str, 
         if chart_file_path and os.path.exists(chart_file_path):
             try:
                 from chart_renderer import compress_image  # taruh helper compress di chart_renderer.py
-                chart_file_path = compress_image(chart_file_path)
+                chart_file_path = await asyncio.to_thread(compress_image, chart_file_path)
             except Exception as e:
                 logger.warning(f"Chart compression failed: {e}")
 
