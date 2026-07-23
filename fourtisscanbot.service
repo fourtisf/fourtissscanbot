@@ -17,22 +17,21 @@
 Description=FourtisScanBot Telegram Bot
 After=network-online.target
 Wants=network-online.target
+# StartLimit ada di [Unit] (bukan [Service]). 0 = jangan pernah menyerah
+# me-restart, supaya bot tidak pernah "stay down".
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=fourtis
-WorkingDirectory=/home/fourtis/fourtissscanbot
+User=root
+WorkingDirectory=/root/fourtissscanbot
 # Pakai python dari venv kalau ada, atau python3 sistem.
-ExecStart=/home/fourtis/fourtissscanbot/venv/bin/python telegram_bot.py
-EnvironmentFile=/home/fourtis/fourtissscanbot/.env
+ExecStart=/root/fourtissscanbot/venv/bin/python telegram_bot.py
+EnvironmentFile=/root/fourtissscanbot/.env
 
 # Auto-restart kalau proses mati karena error/OOM.
 Restart=always
 RestartSec=5
-
-# Batasi spam restart: maksimal 5 restart dalam 60 detik.
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # Log ke journald.
 StandardOutput=journal

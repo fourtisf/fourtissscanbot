@@ -62,7 +62,15 @@ cp .env.example .env
 ./run_bot.sh
 ```
 
-**Cara produksi (paling andal, di VPS) — pakai systemd:**
+**Cara produksi A — PM2 (kalau sudah pakai PM2):**
+```bash
+# dari dalam folder bot
+pm2 start ecosystem.config.js   # atau: pm2 restart botscan (kalau sudah ada)
+pm2 save                        # supaya nyala lagi otomatis saat reboot
+pm2 logs botscan                # lihat log real-time
+```
+
+**Cara produksi B — systemd (kalau TIDAK pakai PM2):**
 ```bash
 # sesuaikan path & user di dalam file dulu
 sudo cp fourtisscanbot.service /etc/systemd/system/
@@ -71,6 +79,10 @@ sudo systemctl enable --now fourtisscanbot
 sudo systemctl status fourtisscanbot        # cek status
 sudo journalctl -u fourtisscanbot -f         # lihat log real-time
 ```
+
+> ⚠️ **Pilih SATU saja** (PM2 **atau** systemd **atau** run_bot.sh). Menjalankan
+> lebih dari satu untuk token yang sama = dua instance = error **Conflict** =
+> bot mati. Ini penyebab umum bot berhenti sendiri.
 
 ---
 
