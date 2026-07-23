@@ -40,7 +40,27 @@ journalctl -u fourtissscanbot -f   # lihat log
 
 **Hanya boleh ada SATU instance bot yang polling.** Dua instance (atau orang
 lain yang memegang token) menyebabkan error `409 Conflict` dan bot berhenti
-menerima pesan tanpa crash — terlihat hidup tapi tidak menjawab.
+menerima pesan tanpa crash — terlihat hidup tapi tidak menjawab. **Pilih SATU
+supervisor saja** (PM2 **atau** systemd **atau** `run_bot.sh`), jangan dua-duanya.
+
+### Alternatif supervisor: PM2
+
+```bash
+pm2 start ecosystem.config.js   # atau: pm2 restart botscan (kalau sudah ada)
+pm2 save                        # supaya nyala lagi otomatis saat reboot
+pm2 logs botscan
+```
+
+## 🛡️ Ketahanan otomatis (sudah terpasang)
+
+- **Webhook auto-delete saat start** — kalau ada webhook aktif, mode polling
+  kena `409 Conflict` dan bot diam total. Bot kini menghapus webhook otomatis
+  tiap start (`_post_init`), jadi masalah ini tidak terulang.
+- **Watchdog anti-freeze** — kalau event loop beku > `WATCHDOG_TIMEOUT` detik,
+  proses dipaksa keluar supaya supervisor me-restart. Untuk kasus "hidup tapi
+  membeku" yang tidak bisa ditolong auto-restart biasa.
+- **Supervisor loop internal** — kalau `run_polling` crash fatal, proses
+  otomatis start ulang (backoff bertahap).
 
 ## ⚠️ Migrasi satu kali di server (WAJIB dibaca sebelum `git pull`)
 

@@ -1,21 +1,41 @@
 # promo_manager.py
 import json
 import os
+import asyncio
 from datetime import datetime
 
 REPORT_FILE = os.path.join(os.path.dirname(__file__), "promo.json")
+
+
+# ----------------------------
+# Helper baca/tulis file (aman & atomik)
+# ----------------------------
+def _read_promos() -> dict:
+    if not os.path.exists(REPORT_FILE):
+        return {}
+    try:
+        with open(REPORT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"DEBUG: Failed to read promo.json: {e}")
+        return {}
+
+
+def _write_promos(data: dict) -> None:
+    try:
+        tmp = REPORT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, REPORT_FILE)  # atomik, cegah file rusak
+    except Exception as e:
+        print(f"DEBUG: Failed to write promo.json: {e}")
+
 
 # ----------------------------
 # Add a global promo with expiry
 # ----------------------------
 async def add_report(text: str, expiry: datetime) -> str:
-    data = {}
-    if os.path.exists(REPORT_FILE):
-        try:
-            with open(REPORT_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"DEBUG: Failed to read promo.json: {e}")
+    data = await asyncio.to_thread(_read_promos)
 
     promos = data.get("global", [])
     promos.append({
@@ -24,65 +44,62 @@ async def add_report(text: str, expiry: datetime) -> str:
     })
     data["global"] = promos
 
-    try:
-        with open(REPORT_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"DEBUG: promo.json successfully updated")
-    except Exception as e:
-        print(f"DEBUG: Failed to write promo.json: {e}")
-
+    await asyncio.to_thread(_write_promos, data)
     return "✅ Promo added."
+
 
 # ----------------------------
 # Reset all promos
 # ----------------------------
 async def reset_reports() -> str:
-    if os.path.exists(REPORT_FILE):
-        os.remove(REPORT_FILE)
-        print(f"DEBUG: promo.json removed")
+    def _remove():
+        try:
+            if os.path.exists(REPORT_FILE):
+                os.remove(REPORT_FILE)
+                print("DEBUG: promo.json removed")
+        except Exception as e:
+            print(f"DEBUG: Failed to remove promo.json: {e}")
+
+    await asyncio.to_thread(_remove)
     return "✅ All promos have been reset."
+
 
 # ----------------------------
 # Get all global promos (filter expired)
 # ----------------------------
 async def get_custom_report() -> str:
-    if not os.path.exists(REPORT_FILE):
-        return ""
-
-    try:
-        with open(REPORT_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"DEBUG: Failed to read promo.json: {e}")
+    data = await asyncio.to_thread(_read_promos)
+    if not data:
         return ""
 
     now = datetime.utcnow()
     valid_promos = []
     updated_promos = []
+    changed = False
 
-    # Fungsi ini dipanggil di akhir SETIAP scan — satu entri promo yang rusak
-    # (expiry bukan ISO format / key hilang / struktur salah) tidak boleh
-    # bikin semua scan error.
-    entries = data.get("global", []) if isinstance(data, dict) else []
-    for promo in entries:
+    for promo in data.get("global", []):
+        expiry_raw = promo.get("expiry")
+        # Entri rusak (tanpa expiry / format salah) TIDAK boleh membuat
+        # seluruh laporan token crash — cukup lewati entri itu.
         try:
-            expiry = datetime.fromisoformat(promo["expiry"])
-            text = promo["text"]
-            if not isinstance(text, str) or not text:
-                raise ValueError("promo 'text' missing or not a string")
-        except (KeyError, TypeError, ValueError) as e:
-            print(f"DEBUG: Skipping malformed promo entry: {e}")
+            expiry = datetime.fromisoformat(expiry_raw) if expiry_raw else None
+        except (ValueError, TypeError):
+            expiry = None
+
+        if expiry is None:
+            changed = True  # buang entri rusak
             continue
+
         if expiry > now:
-            valid_promos.append(text)
+            valid_promos.append(promo.get("text", ""))
             updated_promos.append(promo)
+        else:
+            changed = True  # expired → dibuang
 
-    # optional: remove expired promos
-    try:
+    # Hanya tulis ulang kalau memang ada perubahan → kurangi I/O di hot path
+    # dan hindari race menulis file pada tiap scan.
+    if changed:
         data["global"] = updated_promos
-        with open(REPORT_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"DEBUG: Failed to rewrite promo.json: {e}")
+        await asyncio.to_thread(_write_promos, data)
 
-    return "\n".join(valid_promos)
+    return "\n".join(p for p in valid_promos if p)

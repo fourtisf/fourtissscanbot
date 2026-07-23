@@ -3,11 +3,21 @@ import sqlite3
 import asyncio
 import re
 import random
+from contextlib import closing
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont
 from stats_manager import track_scan
 import aiohttp
+
+# Timeout menunggu kunci DB (detik). SQLite akan menunggu daripada langsung
+# error "database is locked" saat ada penulisan bersamaan.
+DB_TIMEOUT = 30
+
+
+def _connect():
+    """Buka koneksi SQLite dengan timeout kunci."""
+    return sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
 
 # -------- CONFIG --------
 # Path di-anchor ke folder repo supaya DB/template/font tetap ketemu
@@ -32,94 +42,94 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # -------- DB --------
 def init_db():
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    cursor = conn.cursor()
-
-    # Periksa apakah tabel 'scans' sudah ada
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS scans (
-        id INTEGER PRIMARY KEY,
-        user_id INTEGER,
-        username TEXT,
-        token_query TEXT,
-        token_symbol TEXT,
-        chain TEXT,
-        mcap_at_scan REAL,
-        scanned_at TIMESTAMP
-    )
-    """)
-    conn.commit()
-
-    # Periksa apakah kolom 'chat_id' sudah ada. Jika belum, tambahkan.
+    conn = None
     try:
-        cursor.execute("SELECT chat_id FROM scans LIMIT 1")
-    except sqlite3.OperationalError:
-        cursor.execute("ALTER TABLE scans ADD COLUMN chat_id INTEGER")
+        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        cursor = conn.cursor()
+
+        # Periksa apakah tabel 'scans' sudah ada
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            username TEXT,
+            token_query TEXT,
+            token_symbol TEXT,
+            chain TEXT,
+            mcap_at_scan REAL,
+            scanned_at TIMESTAMP
+        )
+        """)
         conn.commit()
 
-    conn.close()
+        # Periksa apakah kolom 'chat_id' sudah ada. Jika belum, tambahkan.
+        try:
+            cursor.execute("SELECT chat_id FROM scans LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE scans ADD COLUMN chat_id INTEGER")
+            conn.commit()
+    except Exception as e:
+        # Jangan biarkan DB bermasalah menggagalkan import modul ini —
+        # kalau import gagal, seluruh bot tidak bisa start.
+        print(f"[WARN] init_db gagal: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 init_db()
 
 
 def save_scan_row(user_id: int, username: str, token_query: str, token_symbol: str, chain: str, mcap: float, chat_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""INSERT INTO scans (user_id,username,token_query,token_symbol,chain,mcap_at_scan,scanned_at, chat_id)
-                    VALUES (?,?,?,?,?,?,?,?)""",
-                 (user_id, username, token_query, token_symbol, chain, float(mcap), datetime.now(timezone.utc), chat_id))
-    conn.commit()
-    conn.close()
+    with closing(_connect()) as conn:
+        conn.execute("""INSERT INTO scans (user_id,username,token_query,token_symbol,chain,mcap_at_scan,scanned_at, chat_id)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                     (user_id, username, token_query, token_symbol, chain, float(mcap), datetime.now(timezone.utc), chat_id))
+        conn.commit()
 
 
 def get_latest_scan_for_user(user_id: int, token_query: Optional[str] = None):
     """
     Mengambil data scan terbaru untuk user, bisa berdasarkan token atau alamat.
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    with closing(_connect()) as conn:
+        cur = conn.cursor()
 
-    if token_query:
-        # Definisikan pola regex untuk mendeteksi alamat kontrak
-        # Ini akan mengenali alamat ETH/BSC (0x...), Solana, dan Tron
-        contract_address_pattern = r'(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44}|T[a-zA-Z0-9]{33})'
+        if token_query:
+            # Definisikan pola regex untuk mendeteksi alamat kontrak
+            # Ini akan mengenali alamat ETH/BSC (0x...), Solana, dan Tron
+            contract_address_pattern = r'(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44}|T[a-zA-Z0-9]{33})'
 
-        # Periksa apakah token_query adalah alamat kontrak
-        if re.match(contract_address_pattern, token_query):
-            # Jika itu alamat, cari di kolom 'token_query' yang menyimpan alamat asli.
-            cur.execute(
-                "SELECT * FROM scans WHERE user_id=? AND token_query=? ORDER BY scanned_at DESC LIMIT 1",
-                (user_id, token_query)
-            )
+            # Periksa apakah token_query adalah alamat kontrak
+            if re.match(contract_address_pattern, token_query):
+                # Jika itu alamat, cari di kolom 'token_query' yang menyimpan alamat asli.
+                cur.execute(
+                    "SELECT * FROM scans WHERE user_id=? AND token_query=? ORDER BY scanned_at DESC LIMIT 1",
+                    (user_id, token_query)
+                )
+            else:
+                # Jika itu bukan alamat (asumsikan itu simbol), cari di kolom 'token_symbol'.
+                # Gunakan LOWER() untuk pencarian case-insensitive.
+                cur.execute(
+                    "SELECT * FROM scans WHERE user_id=? AND LOWER(token_symbol)=? ORDER BY scanned_at DESC LIMIT 1",
+                    (user_id, token_query.lower())
+                )
         else:
-            # Jika itu bukan alamat (asumsikan itu simbol), cari di kolom 'token_symbol'.
-            # Gunakan LOWER() untuk pencarian case-insensitive.
-            cur.execute(
-                "SELECT * FROM scans WHERE user_id=? AND LOWER(token_symbol)=? ORDER BY scanned_at DESC LIMIT 1",
-                (user_id, token_query.lower())
-            )
-    else:
-        # Jika tidak ada token_query, ambil scan terbaru milik user
-        cur.execute("SELECT * FROM scans WHERE user_id=? ORDER BY scanned_at DESC LIMIT 1", (user_id,))
+            # Jika tidak ada token_query, ambil scan terbaru milik user
+            cur.execute("SELECT * FROM scans WHERE user_id=? ORDER BY scanned_at DESC LIMIT 1", (user_id,))
 
-    row = cur.fetchone()
-    conn.close()
-    return row
+        return cur.fetchone()
 
 
 def list_scans_for_user(user_id: int, limit: int = 20):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT id, token_query, token_symbol, chain, mcap_at_scan, scanned_at FROM scans WHERE user_id=? ORDER BY scanned_at DESC LIMIT ?",
-                        (user_id, limit)).fetchall()
-    conn.close()
-    return rows
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT id, token_query, token_symbol, chain, mcap_at_scan, scanned_at FROM scans WHERE user_id=? ORDER BY scanned_at DESC LIMIT ?",
+                            (user_id, limit)).fetchall()
 
 
 def list_scans_for_token(token_query: str, limit: int = MAX_ALL_SCANS):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT * FROM scans WHERE token_query=? ORDER BY scanned_at DESC LIMIT ?", (token_query, limit)).fetchall()
-    conn.close()
-    return rows
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT * FROM scans WHERE token_query=? ORDER BY scanned_at DESC LIMIT ?", (token_query, limit)).fetchall()
 
 
 # -------- Utilities --------
@@ -386,8 +396,8 @@ async def scan_command(update, context):
             await loading.edit_text(f"❌ Could not fetch MCAP for `{query}`. Try contract address or token name.")
             return
 
-        # chat_id diteruskan ke fungsi save
-        save_scan_row(user.id, username, query, sym or query, chain or "unknown", float(mcap), chat_id)
+        # chat_id diteruskan ke fungsi save (di thread agar tidak blok event loop)
+        await asyncio.to_thread(save_scan_row, user.id, username, query, sym or query, chain or "unknown", float(mcap), chat_id)
 
         await loading.edit_text(f"✅ Saved scan for `{sym or query}` • MCAP: {fmt_mc(mcap)}")
     except Exception as e:
@@ -419,7 +429,7 @@ async def pnl_command(update, context):
         if not token_arg:
             await update.message.reply_text("Usage: /pnl all <token|address>")
             return
-        rows = list_scans_for_token(token_arg, limit=MAX_ALL_SCANS)
+        rows = await asyncio.to_thread(list_scans_for_token, token_arg, MAX_ALL_SCANS)
         if not rows:
             await update.message.reply_text(f"No saved scans found for {token_arg}.")
             return
@@ -436,7 +446,7 @@ async def pnl_command(update, context):
         return
 
     # --- PERBAIKAN DITAMBAHKAN DI SINI ---
-    row = get_latest_scan_for_user(user.id, token_arg)
+    row = await asyncio.to_thread(get_latest_scan_for_user, user.id, token_arg)
 
     # Jika pencarian pertama gagal, coba resolusi alamat ke simbol
     if not row and is_valid_address_or_symbol(token_arg) and not token_arg.startswith('$'):
@@ -445,7 +455,7 @@ async def pnl_command(update, context):
             mcap_val, symbol, chain = await fetch_current_mcap(token_arg)
             if symbol:
                 print(f"DEBUG: No direct match found, trying symbol '{symbol}' for address '{token_arg}'")
-                row = get_latest_scan_for_user(user.id, symbol)
+                row = await asyncio.to_thread(get_latest_scan_for_user, user.id, symbol)
         except Exception as e:
             print(f"DEBUG: Failed to resolve address to symbol: {e}")
 
@@ -474,32 +484,29 @@ async def pnl_command(update, context):
             await loading.edit_text("❌ Could not fetch current MCAP for the token/address.")
             return
         template_path = random.choice(TEMPLATE_FILES)
-        # Render Pillow itu CPU-bound → jalankan di thread supaya event loop
-        # (dan semua user lain) tidak ikut membeku.
+        # Render gambar PNL berat (PIL + font) → jalankan di thread supaya
+        # tidak membekukan event loop dan membuat bot "hang" untuk semua user.
         out_path = await asyncio.to_thread(
             render_pnl_image, template_path, token_symbol or cur_sym or token_query,
             float(mcap_at_scan or 0.0), float(current_mcap), username, scanned_at_dt,
-            token_query)
+            token_query
+        )
         if not out_path:
             await loading.edit_text("❌ Failed to render image (missing template?).")
             return
         await loading.delete()
+        with open(out_path, "rb") as fh:
+            await update.message.reply_photo(photo=fh)
         try:
-            with open(out_path, "rb") as fh:
-                await update.message.reply_photo(photo=fh)
-        finally:
-            # hapus juga saat pengiriman gagal, supaya generated_pnl/ tidak
-            # menumpuk sampai disk penuh
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
+            os.remove(out_path)
+        except:
+            pass
     except Exception as e:
         await loading.edit_text(f"❌ Error generating PNL image: {e}")
 
 async def list_scans_command(update, context):
     user = update.effective_user
-    rows = list_scans_for_user(user.id, limit=20)
+    rows = await asyncio.to_thread(list_scans_for_user, user.id, 20)
     if not rows:
         await update.message.reply_text("You have no saved scans. Use /scan <token> to create one.")
         return
@@ -531,8 +538,9 @@ async def process_and_save_scan(update, context, token_query: str):
     try:
         mcap, sym, chain = await fetch_current_mcap(token_query)
         if mcap is not None:
-            # ✅ Tindakan 1: Simpan data ke database (untuk /pnl)
-            save_scan_row(
+            # ✅ Tindakan 1: Simpan data ke database (untuk /pnl) — di thread.
+            await asyncio.to_thread(
+                save_scan_row,
                 user.id,
                 username,
                 token_query,

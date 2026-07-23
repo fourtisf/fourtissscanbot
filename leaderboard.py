@@ -45,12 +45,11 @@ def list_scans_for_leaderboard(since_date: datetime, chat_id: int):
     Mengambil semua data scan dari database setelah tanggal tertentu, termasuk tanggal scan,
     tergantung pada chat_id yang diberikan.
     """
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT user_id, username, token_query, mcap_at_scan, scanned_at FROM scans WHERE scanned_at > ? AND chat_id = ?",
-        (since_date.isoformat(), chat_id)).fetchall()
-    conn.close()
-    return rows
+    from contextlib import closing
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        return conn.execute(
+            "SELECT user_id, username, token_query, mcap_at_scan, scanned_at FROM scans WHERE scanned_at > ? AND chat_id = ?",
+            (since_date.isoformat(), chat_id)).fetchall()
 
 
 # === DEXSCREENER ONLY ===
@@ -90,7 +89,7 @@ async def get_leaderboard_data(period: str, chat_id: int) -> tuple:
     """
     time_delta = {'1D': 1, '3D': 3, '1W': 7, '3W': 21}.get(period, 1)
     since_date = datetime.now(timezone.utc) - timedelta(days=time_delta)
-    rows = list_scans_for_leaderboard(since_date, chat_id)
+    rows = await asyncio.to_thread(list_scans_for_leaderboard, since_date, chat_id)
 
     # Filter data agar hanya ada satu entri per (user_id, token_query)
     unique_scans = {}

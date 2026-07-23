@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import asyncio
-from telegram.error import BadRequest
+import traceback
+import time
+import threading
+from telegram.error import BadRequest, Conflict, NetworkError, TimedOut, RetryAfter, TelegramError
 from datetime import datetime, timezone, time as dt_time
 from globals import admin_manager, ADMIN_IDS
 from leaderboard import leaderboard_command
@@ -76,12 +79,31 @@ def get_current_time_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  # UTC-5
 
 
+async def _post_init(application):
+    """
+    Dijalankan SEKALI saat bot start, sebelum polling dimulai.
+
+    Hapus webhook kalau ada. Kalau webhook masih aktif di sisi Telegram,
+    mode polling (getUpdates) SELALU kena error 409 Conflict dan bot TIDAK
+    bisa menerima/mengirim pesan sama sekali. Menghapus webhook di sini
+    membuat masalah ini tidak pernah terjadi lagi, otomatis, tiap start.
+    """
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook dihapus — mode polling siap menerima pesan.")
+    except Exception as e:
+        logger.warning(f"⚠️ Gagal menghapus webhook saat start: {e}")
+
+
 class TelegramCryptoBot:
     """Telegram bot implementation with emoji animations for all users"""
 
     def __init__(self, token: str, admin_ids: list | None = None):
         self.token = token
         self.config = CryptoBotConfig()
+
+        # Heartbeat untuk watchdog anti-freeze (lihat _start_watchdog & run()).
+        self._last_heartbeat = time.monotonic()
 
         # Load stats dari file JSON (mengisi module-level stats)
         load_stats()
@@ -90,6 +112,8 @@ class TelegramCryptoBot:
         # concurrent_updates(True): tanpa ini PTB memproses update satu per satu,
         # sehingga satu request chart (±40-100 detik render Playwright) membuat
         # SEMUA user lain tidak dijawab — gejala "bot berhenti/macet".
+        # .post_init(_post_init): hapus webhook otomatis sebelum polling,
+        # supaya tidak pernah kena 409 Conflict "webhook is active".
         self.application = ApplicationBuilder().token(token).concurrent_updates(True).request(
             HTTPXRequest(
                 connection_pool_size=50,
@@ -98,7 +122,7 @@ class TelegramCryptoBot:
                 connect_timeout=20.0,
                 write_timeout=20.0
             )
-        ).build()
+        ).post_init(_post_init).build()
         self.admin_report_manager = AdminReportManager(admin_ids=[1322401802, 7176469093])
         # Setup command & message handlers
         self.setup_handlers()
@@ -141,6 +165,45 @@ class TelegramCryptoBot:
             time=dt_time(hour=0, minute=0, tzinfo=timezone.utc),
             name="reset_daily_stats_job"
         )
+
+        # 4️⃣ Heartbeat: update timestamp tiap 15 detik. Kalau event loop
+        # membeku (ada blocking call yang lolos), job ini tidak jalan → timestamp
+        # basi → watchdog thread akan memaksa restart. Jaring pengaman terakhir
+        # supaya bot yang "hang tapi proses masih hidup" tetap pulih.
+        async def _heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
+            self._last_heartbeat = time.monotonic()
+
+        self.application.job_queue.run_repeating(
+            _heartbeat_job,
+            interval=15,
+            first=5,
+            name="heartbeat_job"
+        )
+
+    def _start_watchdog(self):
+        """
+        Jalankan thread daemon yang memantau heartbeat event loop.
+        Kalau loop tidak update heartbeat selama WATCHDOG_TIMEOUT detik
+        (berarti bot beku), paksa keluar dengan exit code != 0 supaya
+        supervisor (PM2 / systemd / run_bot.sh) menjalankan ulang bot.
+        """
+        timeout = int(os.getenv("WATCHDOG_TIMEOUT", "120"))
+        check_every = max(5, timeout // 4)
+
+        def _watch():
+            while True:
+                time.sleep(check_every)
+                age = time.monotonic() - self._last_heartbeat
+                if age > timeout:
+                    logger.critical(
+                        f"🩺 WATCHDOG: event loop beku selama {int(age)}s "
+                        f"(> {timeout}s). Memaksa restart proses..."
+                    )
+                    os._exit(1)
+
+        t = threading.Thread(target=_watch, name="watchdog", daemon=True)
+        t.start()
+        logger.info(f"🩺 Watchdog aktif (timeout {timeout}s).")
 
     def emoji(self, name, default='💠'):
         return self.config.CUSTOM_EMOJI_IDS.get(name, {}).get('char', default)
@@ -245,6 +308,11 @@ class TelegramCryptoBot:
                 "bocor segera revoke via @BotFather. Bot tidak akan menerima update "
                 "selama konflik berlangsung."
             )
+            return
+        # Error jaringan sementara — polling akan retry sendiri, cukup log ringan
+        # (jangan cetak traceback penuh yang membanjiri log).
+        if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
+            logger.warning(f"⚠️ Network hiccup (akan retry otomatis): {err}")
             return
         logger.error("Unhandled exception while processing update:", exc_info=err)
         try:
@@ -1277,7 +1345,15 @@ class TelegramCryptoBot:
         print("📊 Features: Price tracking, Charts, Contract scanning")
         print("🔗 Supported: ETH, BSC, SOL, BASE, TRX")
         print("💎 Animated emojis for all users!")
-        self.application.run_polling()
+        # Aktifkan watchdog anti-freeze sebelum mulai polling.
+        self._start_watchdog()
+        # drop_pending_updates=True: buang antrian update lama saat start ulang,
+        #   supaya bot tidak membanjiri diri sendiri memproses backlog.
+        # allowed_updates=ALL_TYPES: pastikan callback query dll tetap diterima.
+        self.application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
 
 
 # Example usage
@@ -1289,9 +1365,31 @@ if __name__ == "__main__":
         print("❌ Please set your Telegram bot token in the .env file")
         print("📱 Get your token from @BotFather on Telegram")
         print("💡 Add TELEGRAM_BOT_TOKEN=your_token_here to your .env file")
-        # exit code != 0 supaya supervisor (systemd) tahu bot GAGAL start,
+        # exit code != 0 supaya supervisor (PM2/systemd) tahu bot GAGAL start,
         # bukan diam-diam "sukses" lalu mati
         sys.exit(1)
     else:
-        bot = TelegramCryptoBot(BOT_TOKEN)
-        bot.run()
+        # Loop supervisor sederhana: kalau run_polling berhenti karena error
+        # fatal (bukan Ctrl+C), tunggu sebentar lalu start ulang otomatis,
+        # daripada proses langsung mati dan bot "berhenti running" permanen.
+        backoff = 5
+        while True:
+            try:
+                # Event loop baru tiap iterasi: run_polling menutup loop-nya
+                # saat berhenti, jadi restart butuh loop yang segar & terbuka.
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                bot = TelegramCryptoBot(BOT_TOKEN)
+                bot.run()
+                logger.info("Bot dihentikan secara normal. Keluar.")
+                break
+            except (KeyboardInterrupt, SystemExit):
+                logger.info("Menerima sinyal stop. Keluar.")
+                break
+            except Exception as e:
+                logger.error(
+                    f"💥 Bot crash dengan error fatal: {e}. "
+                    f"Restart otomatis dalam {backoff} detik...",
+                    exc_info=True,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
