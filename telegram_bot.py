@@ -78,6 +78,22 @@ def get_current_time_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  # UTC-5
 
 
+async def _post_init(application):
+    """
+    Dijalankan SEKALI saat bot start, sebelum polling dimulai.
+
+    Hapus webhook kalau ada. Kalau webhook masih aktif di sisi Telegram,
+    mode polling (getUpdates) SELALU kena error 409 Conflict dan bot TIDAK
+    bisa menerima/mengirim pesan sama sekali. Menghapus webhook di sini
+    membuat masalah ini tidak pernah terjadi lagi, otomatis, tiap start.
+    """
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook dihapus — mode polling siap menerima pesan.")
+    except Exception as e:
+        logger.warning(f"⚠️ Gagal menghapus webhook saat start: {e}")
+
+
 class TelegramCryptoBot:
     """Telegram bot implementation with emoji animations for all users"""
 
@@ -92,6 +108,8 @@ class TelegramCryptoBot:
         load_stats()
 
         # Build application
+        # .post_init(_post_init): hapus webhook otomatis sebelum polling,
+        # supaya tidak pernah kena 409 Conflict "webhook is active".
         self.application = ApplicationBuilder().token(token).request(
             HTTPXRequest(
                 connection_pool_size=10,
@@ -99,7 +117,7 @@ class TelegramCryptoBot:
                 connect_timeout=20.0,
                 write_timeout=20.0
             )
-        ).build()
+        ).post_init(_post_init).build()
         self.admin_report_manager = AdminReportManager(admin_ids=[1322401802, 7176469093])
         # Setup command & message handlers
         self.setup_handlers()
