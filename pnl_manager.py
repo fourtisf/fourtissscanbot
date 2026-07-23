@@ -29,32 +29,39 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # -------- DB --------
 def init_db():
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    cursor = conn.cursor()
-
-    # Periksa apakah tabel 'scans' sudah ada
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS scans (
-        id INTEGER PRIMARY KEY,
-        user_id INTEGER,
-        username TEXT,
-        token_query TEXT,
-        token_symbol TEXT,
-        chain TEXT,
-        mcap_at_scan REAL,
-        scanned_at TIMESTAMP
-    )
-    """)
-    conn.commit()
-
-    # Periksa apakah kolom 'chat_id' sudah ada. Jika belum, tambahkan.
+    conn = None
     try:
-        cursor.execute("SELECT chat_id FROM scans LIMIT 1")
-    except sqlite3.OperationalError:
-        cursor.execute("ALTER TABLE scans ADD COLUMN chat_id INTEGER")
+        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        cursor = conn.cursor()
+
+        # Periksa apakah tabel 'scans' sudah ada
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            username TEXT,
+            token_query TEXT,
+            token_symbol TEXT,
+            chain TEXT,
+            mcap_at_scan REAL,
+            scanned_at TIMESTAMP
+        )
+        """)
         conn.commit()
 
-    conn.close()
+        # Periksa apakah kolom 'chat_id' sudah ada. Jika belum, tambahkan.
+        try:
+            cursor.execute("SELECT chat_id FROM scans LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE scans ADD COLUMN chat_id INTEGER")
+            conn.commit()
+    except Exception as e:
+        # Jangan biarkan DB bermasalah menggagalkan import modul ini —
+        # kalau import gagal, seluruh bot tidak bisa start.
+        print(f"[WARN] init_db gagal: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 init_db()

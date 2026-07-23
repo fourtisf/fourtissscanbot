@@ -1,10 +1,26 @@
 # Ignore Python virtual environment
 venv/
+.venv/
 
 # Byte-compiled / cache files
 __pycache__/
 *.pyc
 *.pyo
+
+# Secrets — JANGAN pernah commit token/API key!
+# Pakai .env.example sebagai template, isi nilai asli hanya di .env lokal.
+.env
+.env.local
+*.env
+
+# File sementara dari atomic write (save_stats)
+*.tmp
+
+# Artefak chart/PNL yang di-generate saat runtime (mencegah churn commit).
+# File state penting (scans.db, stats.json) SENGAJA tetap di-track agar
+# data bertahan antar-deploy.
+charts/
+generated_pnl/
 
 # System files
 .DS_Store

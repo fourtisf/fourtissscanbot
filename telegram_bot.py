@@ -2,7 +2,8 @@ import asyncio
 import json
 import logging
 import asyncio
-from telegram.error import BadRequest
+import traceback
+from telegram.error import BadRequest, Conflict, NetworkError, TimedOut, RetryAfter, TelegramError
 from datetime import datetime, timezone, time as dt_time
 from globals import admin_manager, ADMIN_IDS
 from leaderboard import leaderboard_command
@@ -261,6 +262,38 @@ class TelegramCryptoBot:
             self.handle_media_with_caption
         ))
 
+        # Global error handler — WAJIB supaya exception di handler/job
+        # tidak membuat bot berhenti diam-diam.
+        self.application.add_error_handler(self.error_handler)
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Menangkap SEMUA exception yang tidak tertangani dari handler & job.
+        Tanpa ini, error hanya akan muncul sebagai warning "No error handlers
+        are registered" dan sebagian error bisa menghentikan polling.
+        """
+        err = context.error
+
+        # Conflict = ada instance bot LAIN yang polling dengan token yang sama.
+        # Ini penyebab paling umum bot "mati sendiri". Jangan crash — cukup log
+        # jelas supaya operator tahu harus mematikan instance ganda.
+        if isinstance(err, Conflict):
+            logger.error(
+                "❌ CONFLICT: Ada instance bot lain yang sedang berjalan dengan "
+                "token yang sama (getUpdates conflict). Pastikan HANYA SATU proses "
+                "bot yang jalan. Token mungkin bocor — segera rotate via @BotFather."
+            )
+            return
+
+        # Error jaringan sementara — biarkan polling retry, cukup log ringan.
+        if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
+            logger.warning(f"⚠️ Network hiccup (akan retry otomatis): {err}")
+            return
+
+        # Semua error lain: log lengkap dengan traceback, TAPI jangan crash.
+        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+        logger.error(f"❌ Unhandled exception saat memproses update:\n{tb}")
+
     async def promo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         CE = getattr(self.config, "CUSTOM_EMOJI_IDS", {})
         link_emoji = CE.get("link", {}).get("char", "🔗")
@@ -336,14 +369,15 @@ class TelegramCryptoBot:
         """
         from stats_manager import get_status_message, load_stats
 
-        # pastikan stats ter-load
-        load_stats()
-
         # hanya kirim ke user tertentu
         AUTHORIZED_USER = 5231963014
-        message = get_status_message()
 
+        # Semua di dalam try: load_stats()/get_status_message() bisa raise
+        # (mis. KeyError kalau stats.json rusak) dan job ini tidak boleh
+        # membuat exception yang tidak tertangani.
         try:
+            load_stats()  # pastikan stats ter-load
+            message = get_status_message()
             await context.bot.send_message(
                 chat_id=AUTHORIZED_USER,
                 text=message,
@@ -1201,7 +1235,14 @@ class TelegramCryptoBot:
         print("📊 Features: Price tracking, Charts, Contract scanning")
         print("🔗 Supported: ETH, BSC, SOL, BASE, TRX")
         print("💎 Animated emojis for all users!")
-        self.application.run_polling()
+        # drop_pending_updates=True: buang antrian update lama saat start ulang,
+        #   supaya bot tidak membanjiri diri sendiri memproses backlog setelah
+        #   sempat mati (penyebab umum "start lalu langsung mati lagi").
+        # allowed_updates=ALL_TYPES: pastikan callback query, dsb, tetap diterima.
+        self.application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
 
 
 # Example usage
@@ -1212,5 +1253,32 @@ if __name__ == "__main__":
         print("📱 Get your token from @BotFather on Telegram")
         print("💡 Add TELEGRAM_BOT_TOKEN=your_token_here to your .env file")
     else:
-        bot = TelegramCryptoBot(BOT_TOKEN)
-        bot.run()
+        # Loop supervisor sederhana: kalau run_polling berhenti karena error
+        # fatal (bukan Ctrl+C), tunggu sebentar lalu start ulang otomatis,
+        # daripada proses langsung mati dan bot "berhenti running" permanen.
+        import time
+
+        backoff = 5
+        while True:
+            try:
+                # Event loop baru tiap iterasi: run_polling menutup loop-nya
+                # saat berhenti, jadi restart butuh loop yang segar & terbuka.
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                bot = TelegramCryptoBot(BOT_TOKEN)
+                bot.run()
+                # run_polling selesai normal (Ctrl+C / SIGTERM) → keluar.
+                logger.info("Bot dihentikan secara normal. Keluar.")
+                break
+            except (KeyboardInterrupt, SystemExit):
+                logger.info("Menerima sinyal stop. Keluar.")
+                break
+            except Exception as e:
+                logger.error(
+                    f"💥 Bot crash dengan error fatal: {e}. "
+                    f"Restart otomatis dalam {backoff} detik...",
+                    exc_info=True,
+                )
+                time.sleep(backoff)
+                # Naikkan jeda restart bertahap sampai maksimal 5 menit,
+                # supaya tidak spam restart kalau error terus berulang.
+                backoff = min(backoff * 2, 300)

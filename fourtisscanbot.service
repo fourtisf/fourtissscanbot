@@ -1,0 +1,42 @@
+# =============================================================
+# systemd unit untuk FourtisScanBot (auto-restart level OS).
+#
+# Ini cara PALING ANDAL supaya bot tidak pernah "berhenti running":
+# systemd akan otomatis menghidupkan ulang bot kalau mati, dan
+# menjalankannya lagi setiap server reboot.
+#
+# CARA PASANG (di VPS, sebagai root):
+#   1. Sesuaikan User, WorkingDirectory, dan ExecStart di bawah.
+#   2. sudo cp fourtisscanbot.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now fourtisscanbot
+#   5. Cek status : sudo systemctl status fourtisscanbot
+#      Cek log    : sudo journalctl -u fourtisscanbot -f
+# =============================================================
+[Unit]
+Description=FourtisScanBot Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fourtis
+WorkingDirectory=/home/fourtis/fourtissscanbot
+# Pakai python dari venv kalau ada, atau python3 sistem.
+ExecStart=/home/fourtis/fourtissscanbot/venv/bin/python telegram_bot.py
+EnvironmentFile=/home/fourtis/fourtissscanbot/.env
+
+# Auto-restart kalau proses mati karena error/OOM.
+Restart=always
+RestartSec=5
+
+# Batasi spam restart: maksimal 5 restart dalam 60 detik.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Log ke journald.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

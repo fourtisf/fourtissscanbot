@@ -1,5 +1,7 @@
 import json
 import os
+import copy
+import threading
 from datetime import datetime, timezone
 import aiohttp
 import asyncio
@@ -7,6 +9,13 @@ import asyncio
 STATS_FILE = "stats.json"
 BACKUP_FILE = "stats_backup.json"
 AUTHORIZED_USER = 5231963014  # user yang menerima report
+
+# Lock untuk melindungi 'stats' dari akses bersamaan.
+# save_stats() dijalankan via asyncio.to_thread() (thread lain) tiap 60 detik,
+# sementara handler di event loop bisa memodifikasi 'stats' pada saat yang sama.
+# Tanpa lock, json.dump() bisa crash: "dictionary changed size during iteration"
+# dan file stats.json bisa rusak/terpotong.
+_stats_lock = threading.Lock()
 
 # ================= Stats default =================
 stats = {
@@ -78,6 +87,17 @@ def load_stats():
 
         stats["scans_by_chain"] = cleaned_chains
 
+    # Pastikan semua key wajib ada supaya handler/status tidak KeyError
+    # kalau stats.json lama tidak lengkap atau sebagian rusak.
+    stats.setdefault("total_users", 0)
+    stats.setdefault("total_groups", 0)
+    stats.setdefault("scans_today", 0)
+    stats.setdefault("total_scans", 0)
+    stats.setdefault("users", [])
+    stats.setdefault("groups", [])
+    stats.setdefault("last_reset", None)
+    stats.setdefault("scans_by_chain", {})
+
     # Ensure all default chains exist
     default_chains = {
         "BSC": {"today": 0, "total": 0},
@@ -101,10 +121,21 @@ def save_stats():
         print("[WARN] Stats kosong, skip save")
         return
     try:
-        with open(STATS_FILE, "w") as f:
-            json.dump(stats, f, indent=2, sort_keys=True)
-        with open(BACKUP_FILE, "w") as f:
-            json.dump(stats, f, indent=2, sort_keys=True)
+        # Ambil snapshot di bawah lock supaya tidak ada thread lain yang
+        # memodifikasi 'stats' selagi kita menulisnya (anti "changed size
+        # during iteration" & anti file terpotong).
+        with _stats_lock:
+            snapshot = copy.deepcopy(stats)
+
+        payload = json.dumps(snapshot, indent=2, sort_keys=True)
+
+        # Tulis atomik: tulis ke file sementara lalu rename, supaya kalau
+        # proses mati di tengah penulisan, file lama tidak ikut rusak.
+        for target in (STATS_FILE, BACKUP_FILE):
+            tmp = f"{target}.tmp"
+            with open(tmp, "w") as f:
+                f.write(payload)
+            os.replace(tmp, target)
     except Exception as e:
         print(f"[WARN] Gagal save stats: {e}")
 
@@ -118,7 +149,10 @@ async def detect_chain_from_address(address: str) -> str:
 
     url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
     try:
-        async with aiohttp.ClientSession() as session:
+        # Timeout wajib: tanpa ini, kalau API menggantung, handler ikut hang
+        # tanpa batas dan bot terlihat "mati" walau proses masih hidup.
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -165,14 +199,17 @@ def track_chat(chat):
     """Tambah chat (user / group) ke database"""
     global stats
     chat_id = chat.id
-    if chat.type in ("group", "supergroup", "channel"):
-        if chat_id not in stats["groups"]:
-            stats["groups"].append(chat_id)
-            stats["total_groups"] += 1
-    else:
-        if chat_id not in stats["users"]:
-            stats["users"].append(chat_id)
-            stats["total_users"] += 1
+    # Lock hanya di sekitar mutasi (cepat). save_stats() dipanggil di luar lock
+    # supaya tidak deadlock (threading.Lock tidak reentrant).
+    with _stats_lock:
+        if chat.type in ("group", "supergroup", "channel"):
+            if chat_id not in stats["groups"]:
+                stats["groups"].append(chat_id)
+                stats["total_groups"] += 1
+        else:
+            if chat_id not in stats["users"]:
+                stats["users"].append(chat_id)
+                stats["total_users"] += 1
     save_stats()
 
 
@@ -188,17 +225,19 @@ async def track_scan(token_address: str = None, chain: str = None):
 
     chain = chain.upper()
 
-    if chain not in stats["scans_by_chain"]:
-        stats["scans_by_chain"][chain] = {"today": 0, "total": 0}
+    with _stats_lock:
+        if chain not in stats["scans_by_chain"]:
+            stats["scans_by_chain"][chain] = {"today": 0, "total": 0}
 
-    stats["scans_by_chain"][chain]["today"] += 1
-    stats["scans_by_chain"][chain]["total"] += 1
+        stats["scans_by_chain"][chain]["today"] += 1
+        stats["scans_by_chain"][chain]["total"] += 1
 
-    stats["scans_today"] += 1
-    stats["total_scans"] += 1
+        stats["scans_today"] += 1
+        stats["total_scans"] += 1
+        today_count = stats["scans_by_chain"][chain]["today"]
+        total_count = stats["scans_by_chain"][chain]["total"]
 
-    print(
-        f"[DEBUG] Tracked scan: {chain} - Today: {stats['scans_by_chain'][chain]['today']}, Total: {stats['scans_by_chain'][chain]['total']}")
+    print(f"[DEBUG] Tracked scan: {chain} - Today: {today_count}, Total: {total_count}")
     save_stats()
 
 
