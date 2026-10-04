@@ -1,12 +1,13 @@
 import asyncio
 import json
+import time
 import logging
 import asyncio
 from telegram.error import BadRequest
 from datetime import datetime, timezone, time as dt_time
 from globals import admin_manager, ADMIN_IDS
 from leaderboard import leaderboard_command
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (ApplicationBuilder, Application, CommandHandler, CallbackQueryHandler, MessageHandler)
 from telegram.ext import ContextTypes, filters
 from telegram.constants import ParseMode
@@ -50,6 +51,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# httpx mencatat setiap request ke Telegram (tiap ~10 detik) lengkap dengan token bot di URL.
+# Cukup tampilkan warning/error saja.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 ADMINS = [1322401802, 7176469093]  # replace with your Telegram IDs
 admin_report_manager = AdminReportManager(admin_ids=[1322401802, 7176469093])
@@ -75,6 +79,33 @@ def get_current_time_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  # UTC-5
 
 
+OUTPUT_DIRS = ("charts", "generated_pnl")
+OUTPUT_MAX_AGE_SECONDS = 24 * 3600
+
+
+def _cleanup_output_files() -> int:
+    cutoff = time.time() - OUTPUT_MAX_AGE_SECONDS
+    removed = 0
+    for d in OUTPUT_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            path = os.path.join(d, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except OSError as e:
+                logger.warning(f"Gagal hapus {path}: {e}")
+    return removed
+
+
+async def _cleanup_output_files_job(ctx: ContextTypes.DEFAULT_TYPE):
+    removed = await asyncio.to_thread(_cleanup_output_files)
+    if removed:
+        logger.info(f"[JOB] Hapus {removed} file chart/PnL lama")
+
+
 class TelegramCryptoBot:
     """Telegram bot implementation with emoji animations for all users"""
 
@@ -86,14 +117,17 @@ class TelegramCryptoBot:
         load_stats()
 
         # Build application
+        # concurrent_updates: tanpa ini PTB memproses update satu per satu, jadi satu
+        # scan/chart yang lambat (Playwright menunggu 35+ detik) membuat bot diam untuk semua user.
         self.application = ApplicationBuilder().token(token).request(
             HTTPXRequest(
-                connection_pool_size=10,
+                connection_pool_size=32,
                 read_timeout=20.0,
                 connect_timeout=20.0,
                 write_timeout=20.0
             )
-        ).build()
+        ).concurrent_updates(32).post_init(self._post_init).build()
+        self.application.add_error_handler(self._error_handler)
         self.admin_report_manager = AdminReportManager(admin_ids=[1322401802, 7176469093])
         # Setup command & message handlers
         self.setup_handlers()
@@ -131,6 +165,84 @@ class TelegramCryptoBot:
             time=dt_time(hour=0, minute=0, tzinfo=timezone.utc),
             name="reset_daily_stats_job"
         )
+
+        # 5️⃣ Hapus file chart/PnL lama (> 24 jam) tiap 6 jam supaya disk tidak penuh
+        for d in OUTPUT_DIRS:
+            os.makedirs(d, exist_ok=True)
+        self.application.job_queue.run_repeating(
+            _cleanup_output_files_job,
+            interval=6 * 3600,
+            first=60,
+            name="cleanup_output_files_job"
+        )
+
+        # 4️⃣ Watchdog tiap 5 menit: kalau token di-revoke atau polling berhenti,
+        # proses keluar supaya systemd me-restart bot (bukan diam berbulan-bulan).
+        self.application.job_queue.run_repeating(
+            self._health_job,
+            interval=300,
+            first=300,
+            name="health_job"
+        )
+
+    async def _post_init(self, application: Application):
+        """Log identitas bot & status webhook supaya masalah token/webhook langsung terlihat di log."""
+        me = await application.bot.get_me()
+        logger.info(f"✅ Logged in as @{me.username} (id={me.id})")
+
+        # Menu "/" di Telegram: hanya command yang benar-benar ada handler-nya.
+        # Command admin & /scan, /status tetap jalan, hanya tidak ditampilkan di menu.
+        await application.bot.set_my_commands([
+            BotCommand("start", "Main menu"),
+            BotCommand("c", "Token chart: /c <address or $symbol>"),
+            BotCommand("pnl", "PnL of your scanned tokens"),
+            BotCommand("scans", "Your scan history"),
+            BotCommand("lb", "Scan leaderboard"),
+            BotCommand("fearindex", "BTC Fear & Greed Index"),
+            BotCommand("help", "How to use the bot"),
+        ])
+        info = await application.bot.get_webhook_info()
+        if info.url:
+            logger.warning(f"⚠️ Webhook aktif ke {info.url} — polling akan menghapusnya saat start")
+        if info.pending_update_count:
+            logger.info(f"📥 {info.pending_update_count} pending updates")
+
+    async def _health_job(self, context: ContextTypes.DEFAULT_TYPE):
+        app = context.application
+        try:
+            await context.bot.get_me()
+        except telegram.error.InvalidToken:
+            logger.critical("❌ Token bot tidak valid/di-revoke. Update TELEGRAM_BOT_TOKEN di .env. Bot berhenti.")
+            app.stop_running()
+            return
+        except Exception as e:
+            logger.warning(f"⚠️ Health check gagal (jaringan?): {e}")
+            return
+
+        if app.updater and not app.updater.running:
+            logger.critical("❌ Polling berhenti. Keluar supaya systemd me-restart bot.")
+            app.stop_running()
+            return
+
+        # Opsional: ping monitor eksternal (mis. healthchecks.io) yang kirim alert kalau ping berhenti
+        url = os.getenv("HEALTHCHECK_URL")
+        if url:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as s:
+                    await s.get(url, timeout=aiohttp.ClientTimeout(total=10))
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal ping HEALTHCHECK_URL: {e}")
+
+    async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        err = context.error
+        if isinstance(err, telegram.error.Conflict):
+            logger.error(
+                "❌ Conflict: ada proses lain yang memakai token bot ini (getUpdates/webhook). "
+                "Matikan instance lain atau revoke token di @BotFather."
+            )
+            return
+        logger.error("Unhandled exception while handling update", exc_info=err)
 
     def emoji(self, name, default='💠'):
         return self.config.CUSTOM_EMOJI_IDS.get(name, {}).get('char', default)
@@ -544,8 +656,8 @@ class TelegramCryptoBot:
                         logger.error(f"❌ Error in auto-save scan: {e}", exc_info=True)
 
                 asyncio.create_task(_auto_save_price_scan())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"auto-save scan setup failed: {e}")
 
             # === Check if token is major coin ===
             from main import CryptoPriceScannerBot
@@ -709,7 +821,7 @@ class TelegramCryptoBot:
             )
             try:
                 await loading_msg.edit_text(error_msg, parse_mode=ParseMode.MARKDOWN)
-            except:
+            except Exception:
                 await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
 
     async def timeframe_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,7 +905,7 @@ class TelegramCryptoBot:
                 try:
                     await loading_msg.edit_text(chart_message, parse_mode=ParseMode.MARKDOWN,
                                                 reply_markup=reply_markup)
-                except:
+                except Exception:
                     await update.message.reply_text(chart_message, parse_mode=ParseMode.MARKDOWN,
                                                     reply_markup=reply_markup)
 
@@ -802,7 +914,7 @@ class TelegramCryptoBot:
             error_msg = f"{emoji('cross')} **Error generating chart for:** `{escape_md(query)}`"
             try:
                 await loading_msg.edit_text(error_msg, parse_mode=ParseMode.MARKDOWN)
-            except:
+            except Exception:
                 await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str = None):
@@ -1201,7 +1313,9 @@ class TelegramCryptoBot:
         print("📊 Features: Price tracking, Charts, Contract scanning")
         print("🔗 Supported: ETH, BSC, SOL, BASE, TRX")
         print("💎 Animated emojis for all users!")
-        self.application.run_polling()
+        # bootstrap_retries=-1: kalau internet/Telegram sedang down saat start, terus coba lagi
+        # alih-alih langsung crash. Setelah jalan, PTB otomatis retry error jaringan.
+        self.application.run_polling(bootstrap_retries=-1)
 
 
 # Example usage

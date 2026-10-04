@@ -1,10 +1,11 @@
 import asyncio
 import aiohttp
 import logging
+import time
 from datetime import datetime, timedelta
 import json
 from pair_scanner import detect_pair_address
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import plotly.graph_objects as go
 from promo_manager import get_custom_report
 from security_helper import get_security_info
@@ -394,6 +395,62 @@ class CoinMarketCapAPI:
 
 # ... kode lainnya ...
 
+# ---------- Cache DexScreener (hemat rate limit; banyak user scan token yang sama) ----------
+_DS_CACHE: Dict[str, Tuple[float, Any]] = {}
+_DS_CACHE_TTL = 30  # detik
+_DS_CACHE_MAX = 1000
+
+
+class _CachedResponse:
+    def __init__(self, status: int, data: Any):
+        self.status = status
+        self._data = data
+
+    async def json(self, *args, **kwargs):
+        return self._data
+
+
+class _CachedGet:
+    def __init__(self, session: aiohttp.ClientSession, url: str):
+        self._session = session
+        self._url = url
+
+    async def __aenter__(self):
+        now = time.monotonic()
+        hit = _DS_CACHE.get(self._url)
+        if hit and now - hit[0] < _DS_CACHE_TTL:
+            return _CachedResponse(200, hit[1])
+
+        async with self._session.get(self._url) as r:
+            status = r.status
+            data = await r.json(content_type=None) if status == 200 else None
+        if status == 200:
+            if len(_DS_CACHE) >= _DS_CACHE_MAX:
+                _DS_CACHE.clear()
+            _DS_CACHE[self._url] = (now, data)
+        elif status == 429:
+            logger.warning(f"DexScreener rate limit (429): {self._url}")
+        return _CachedResponse(status, data)
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _CachingSession:
+    """Bungkus aiohttp session: GET ke DexScreener di-cache selama _DS_CACHE_TTL detik."""
+
+    def __init__(self, session: aiohttp.ClientSession):
+        self._session = session
+
+    def get(self, url: str, **kwargs):
+        if kwargs:
+            return self._session.get(url, **kwargs)
+        return _CachedGet(self._session, url)
+
+    async def close(self):
+        await self._session.close()
+
+
 class DexScreenerAPI:
     """Handler for DexScreener API interactions - all data from DexScreener only"""
     BASE_URL = "https://api.dexscreener.com/latest/dex"
@@ -403,7 +460,7 @@ class DexScreenerAPI:
         self.session = None
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        self.session = _CachingSession(aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)))
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -1421,8 +1478,8 @@ async def handle_price_command(query: str) -> Tuple[str, str, Optional[str]]:
                     if pair_data and pair_data.get("pairs"):
                         detected_chain = chain_from_url
                         query = pair_data["pairs"][0]["baseToken"]["address"]
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"DexScreener get_pair_by_id failed: {e}")
 
                 # fallback → contract address
                 if not detected_chain:
@@ -1431,8 +1488,8 @@ async def handle_price_command(query: str) -> Tuple[str, str, Optional[str]]:
                         if pair_data:
                             detected_chain = chain_from_url
                             query = pair_data.get("baseToken", {}).get("address", query)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"DexScreener get_pair_info failed: {e}")
 
             # 🚀 Step 2: Kalau query bisa jadi PairId
             if not detected_chain and re.match(r"^[A-Za-z0-9]{32,44}$", query):

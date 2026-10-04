@@ -9,3 +9,15 @@ __pycache__/
 # System files
 .DS_Store
 Thumbs.db
+
+# Secrets — never commit
+.env
+
+# Data runtime bot — disimpan di server saja, bukan di GitHub
+stats.json
+stats_backup.json
+*.tmp
+scans.db
+promo.json
+charts/
+generated_pnl/
