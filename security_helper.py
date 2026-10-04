@@ -10,9 +10,8 @@ from typing import Any, Dict, List, Optional
 # ==========================
 load_dotenv()
 # Gunakan kembali API key terpisah sesuai permintaan
+# Satu key Etherscan (API V2) dipakai untuk ETH, BSC dan Base
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")
-BASESCAN_API_KEY = os.getenv("BASESCAN_API_KEY")  # Dipertahankan untuk URL Base
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 COVALENT_API_KEY = os.getenv("COVALENT_API_KEY")
 
@@ -20,10 +19,7 @@ COVALENT_API_KEY = os.getenv("COVALENT_API_KEY")
 # API and RPC URLs & Chain IDs
 # ==========================
 API_URLS = {
-    "ethereum": "https://api.etherscan.io/api",
-    "bsc": "https://api.bscscan.com/api",
-    "base": "https://api.basescan.org/api",  # URL ini akan diganti di dalam kode
-    "etherscan_v2_base": "https://api.etherscan.io/v2/api",
+    "etherscan_v2": "https://api.etherscan.io/v2/api",
     "helius_rpc": "https://mainnet.helius-rpc.com/",
     "dexscreener": "https://api.dexscreener.com/latest/dex/tokens/",
     "geckoterminal": "https://api.geckoterminal.com/api/v2/networks/solana/tokens/",
@@ -31,9 +27,6 @@ API_URLS = {
 }
 
 API_KEYS = {
-    "ethereum": ETHERSCAN_API_KEY,
-    "bsc": BSCSCAN_API_KEY,
-    "base": ETHERSCAN_API_KEY,  # Menggunakan API Key Etherscan untuk Base
     "helius": HELIUS_API_KEY
 }
 
@@ -71,16 +64,21 @@ def get_explorer_link(chain: str, address: str) -> str:
     return links.get(chain, "#")
 
 
+def _redact(url: str) -> str:
+    """Sembunyikan API key di URL sebelum ditulis ke log."""
+    return re.sub(r"((?:api[-_]?key|key)=)[^&]+", r"\1***", url, flags=re.IGNORECASE)
+
+
 async def safe_json(session: aiohttp.ClientSession, method: str, url: str, **kwargs) -> Optional[Dict[str, Any]]:
     """Safe wrapper for API requests, returns JSON data."""
     try:
         async with session.request(method, url, **kwargs) as r:
             txt = await r.text()
-            dbg(f"[DEBUG {method.upper()}] {url} -> {r.status} {txt[:200]}")
+            dbg(f"[DEBUG {method.upper()}] {_redact(url)} -> {r.status} {txt[:200]}")
             r.raise_for_status()
             return await r.json()
     except Exception as e:
-        dbg(f"[!] safe_json error {url}: {e}")
+        dbg(f"[!] safe_json error {_redact(url)}: {e}")
         return None
 
 
@@ -101,13 +99,12 @@ async def fetch_pair_address(session: aiohttp.ClientSession, chain: str, token_a
 
 async def is_address_a_contract(session: aiohttp.ClientSession, chain: str, address: str) -> bool:
     """Checks if an address is a contract by looking at its code."""
-    api_key = API_KEYS.get(chain)
-    base_url = API_URLS.get(chain)
+    chain_id = CHAIN_IDS.get(chain)
 
-    if not api_key or not base_url:
+    if not ETHERSCAN_API_KEY or not chain_id:
         return False
 
-    url = f"{base_url}?module=proxy&action=eth_getCode&address={address}&tag=latest&apikey={api_key}"
+    url = f"{API_URLS['etherscan_v2']}?chainid={chain_id}&module=proxy&action=eth_getCode&address={address}&tag=latest&apikey={ETHERSCAN_API_KEY}"
     data = await safe_json(session, "get", url)
 
     if data and data.get("result") and data["result"] != "0x":
@@ -135,78 +132,26 @@ async def check_dexpaid_api(session: aiohttp.ClientSession, chain: str, token_ad
 async def fetch_evm_info(session: aiohttp.ClientSession, chain: str, contract: str) -> Dict[str, Any]:
     """Fetches creator and holders for EVM chains (ETH, BSC, Base)."""
     creator = "N/A"
+    chain_id = CHAIN_IDS.get(chain)
 
-    if chain == "ethereum":
-        api_key = ETHERSCAN_API_KEY
-        base_url = API_URLS["ethereum"]
+    if ETHERSCAN_API_KEY and chain_id:
+        base_url = f"{API_URLS['etherscan_v2']}?chainid={chain_id}"
         try:
-            url_creator = f"{base_url}?module=contract&action=getcontractcreation&contractaddresses={contract}&apikey={api_key}"
-            data = await safe_json(session, "get", url_creator)
-            if data and data.get("status") == "1":
-                res = data.get("result", [])
-                if res:
-                    creator = res[0].get("contractCreator", "N/A")
-                    dbg(f"[DEBUG] Creator ditemukan dari Etherscan ({chain}): {creator}")
-        except Exception as e:
-            dbg(f"[!] Error fetching {chain} creator with Etherscan API: {e}")
-
-        if creator == "N/A":
-            try:
-                url_txs = f"{base_url}?module=account&action=txlist&address={contract}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey={api_key}"
-                data_txs = await safe_json(session, "get", url_txs)
-                if data_txs and data_txs.get("status") == "1":
-                    txs = data_txs.get("result", [])
-                    if txs:
-                        creator = txs[0].get("from", "N/A")
-                        dbg(f"[DEBUG] Creator ditemukan dari Etherscan txlist ({chain}): {creator}")
-            except Exception as e:
-                dbg(f"[!] Error fetching {chain} creator from Etherscan txlist: {e}")
-
-    elif chain == "bsc":
-        api_key = BSCSCAN_API_KEY
-        base_url = API_URLS["bsc"]
-        try:
-            url_creator = f"{base_url}?module=contract&action=getcontractcreation&contractaddresses={contract}&apikey={api_key}"
-            data = await safe_json(session, "get", url_creator)
-            if data and data.get("status") == "1":
-                res = data.get("result", [])
-                if res:
-                    creator = res[0].get("contractCreator", "N/A")
-                    dbg(f"[DEBUG] Creator ditemukan dari BscScan ({chain}): {creator}")
-        except Exception as e:
-            dbg(f"[!] Error fetching {chain} creator with BscScan API: {e}")
-
-        if creator == "N/A":
-            try:
-                url_txs = f"{base_url}?module=account&action=txlist&address={contract}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey={api_key}"
-                data_txs = await safe_json(session, "get", url_txs)
-                if data_txs and data_txs.get("status") == "1":
-                    txs = data_txs.get("result", [])
-                    if txs:
-                        creator = txs[0].get("from", "N/A")
-                        dbg(f"[DEBUG] Creator ditemukan dari BscScan txlist ({chain}): {creator}")
-            except Exception as e:
-                dbg(f"[!] Error fetching {chain} creator from BscScan txlist: {e}")
-
-    elif chain == "base":
-        api_key = ETHERSCAN_API_KEY
-        base_url = API_URLS["etherscan_v2_base"]
-        chain_id = CHAIN_IDS.get(chain)
-
-        try:
-            url_creator = f"{base_url}?chainId={chain_id}&module=contract&action=getcontractcreation&contractaddresses={contract}&apikey={api_key}"
+            url_creator = f"{base_url}&module=contract&action=getcontractcreation&contractaddresses={contract}&apikey={ETHERSCAN_API_KEY}"
             data = await safe_json(session, "get", url_creator)
             if data and data.get("status") == "1":
                 res = data.get("result", [])
                 if res:
                     creator = res[0].get("contractCreator", "N/A")
                     dbg(f"[DEBUG] Creator ditemukan dari Etherscan V2 ({chain}): {creator}")
+            elif data:
+                dbg(f"[!] Etherscan V2 ({chain}) getcontractcreation: {data.get('result')}")
         except Exception as e:
             dbg(f"[!] Error fetching {chain} creator with Etherscan V2 API: {e}")
 
         if creator == "N/A":
             try:
-                url_txs = f"{base_url}?chainId={chain_id}&module=account&action=txlist&address={contract}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey={api_key}"
+                url_txs = f"{base_url}&module=account&action=txlist&address={contract}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey={ETHERSCAN_API_KEY}"
                 data_txs = await safe_json(session, "get", url_txs)
                 if data_txs and data_txs.get("status") == "1":
                     txs = data_txs.get("result", [])
@@ -219,8 +164,8 @@ async def fetch_evm_info(session: aiohttp.ClientSession, chain: str, contract: s
     # --- Perubahan di sini: Mengubah page-size dari 5 ke 10 ---
     holders = []
     try:
-        chain_id = {"ethereum": 1, "bsc": 56, "base": 8453}.get(chain)
-        if chain_id:
+        # Covalent opsional: tanpa key, top holders dilewati
+        if chain_id and COVALENT_API_KEY:
             url_holders = f"https://api.covalenthq.com/v1/{chain_id}/tokens/{contract}/token_holders/?page-size=10&key={COVALENT_API_KEY}"
             data = await safe_json(session, "get", url_holders)
             if data and "data" in data and "items" in data["data"]:
@@ -557,4 +502,4 @@ if __name__ == "__main__":
                     print(f"Error for {chain}: {e}")
 
 
-    asyncio.run(test())
+    asyncio.run(test())

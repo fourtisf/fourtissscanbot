@@ -86,14 +86,17 @@ class TelegramCryptoBot:
         load_stats()
 
         # Build application
+        # concurrent_updates: tanpa ini PTB memproses update satu per satu, jadi satu
+        # scan/chart yang lambat (Playwright menunggu 35+ detik) membuat bot diam untuk semua user.
         self.application = ApplicationBuilder().token(token).request(
             HTTPXRequest(
-                connection_pool_size=10,
+                connection_pool_size=32,
                 read_timeout=20.0,
                 connect_timeout=20.0,
                 write_timeout=20.0
             )
-        ).build()
+        ).concurrent_updates(32).post_init(self._post_init).build()
+        self.application.add_error_handler(self._error_handler)
         self.admin_report_manager = AdminReportManager(admin_ids=[1322401802, 7176469093])
         # Setup command & message handlers
         self.setup_handlers()
@@ -131,6 +134,26 @@ class TelegramCryptoBot:
             time=dt_time(hour=0, minute=0, tzinfo=timezone.utc),
             name="reset_daily_stats_job"
         )
+
+    async def _post_init(self, application: Application):
+        """Log identitas bot & status webhook supaya masalah token/webhook langsung terlihat di log."""
+        me = await application.bot.get_me()
+        logger.info(f"✅ Logged in as @{me.username} (id={me.id})")
+        info = await application.bot.get_webhook_info()
+        if info.url:
+            logger.warning(f"⚠️ Webhook aktif ke {info.url} — polling akan menghapusnya saat start")
+        if info.pending_update_count:
+            logger.info(f"📥 {info.pending_update_count} pending updates")
+
+    async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        err = context.error
+        if isinstance(err, telegram.error.Conflict):
+            logger.error(
+                "❌ Conflict: ada proses lain yang memakai token bot ini (getUpdates/webhook). "
+                "Matikan instance lain atau revoke token di @BotFather."
+            )
+            return
+        logger.error("Unhandled exception while handling update", exc_info=err)
 
     def emoji(self, name, default='💠'):
         return self.config.CUSTOM_EMOJI_IDS.get(name, {}).get('char', default)
@@ -1201,7 +1224,9 @@ class TelegramCryptoBot:
         print("📊 Features: Price tracking, Charts, Contract scanning")
         print("🔗 Supported: ETH, BSC, SOL, BASE, TRX")
         print("💎 Animated emojis for all users!")
-        self.application.run_polling()
+        # bootstrap_retries=-1: kalau internet/Telegram sedang down saat start, terus coba lagi
+        # alih-alih langsung crash. Setelah jalan, PTB otomatis retry error jaringan.
+        self.application.run_polling(bootstrap_retries=-1)
 
 
 # Example usage

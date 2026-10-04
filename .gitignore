@@ -9,3 +9,6 @@ __pycache__/
 # System files
 .DS_Store
 Thumbs.db
+
+# Secrets — never commit
+.env

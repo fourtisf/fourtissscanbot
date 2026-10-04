@@ -1,0 +1,20 @@
+# Linux VPS (systemd): bot auto-start saat server nyala & auto-restart kalau crash.
+# Ganti /opt/fourtissscanbot dengan folder bot Anda, lalu:
+#   sudo cp deploy/fourtisbot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fourtisbot
+# Lihat log:  journalctl -u fourtisbot -f
+[Unit]
+Description=Fourtis Scan Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/fourtissscanbot
+ExecStart=/opt/fourtissscanbot/venv/bin/python telegram_bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
