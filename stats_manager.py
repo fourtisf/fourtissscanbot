@@ -101,10 +101,12 @@ def save_stats():
         print("[WARN] Stats kosong, skip save")
         return
     try:
-        with open(STATS_FILE, "w") as f:
-            json.dump(stats, f, indent=2, sort_keys=True)
-        with open(BACKUP_FILE, "w") as f:
-            json.dump(stats, f, indent=2, sort_keys=True)
+        data = json.dumps(stats, indent=2, sort_keys=True)
+        for path in (STATS_FILE, BACKUP_FILE):
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(data)
+            os.replace(tmp, path)
     except Exception as e:
         print(f"[WARN] Gagal save stats: {e}")
 

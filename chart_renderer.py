@@ -1,10 +1,14 @@
 import os
+import asyncio
 import logging
 from PIL import Image
 import aiohttp
 from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
+
+# Maksimal 2 Chromium bersamaan; request chart lain antre, supaya server tidak kehabisan RAM.
+_BROWSER_SLOTS = asyncio.Semaphore(int(os.getenv("MAX_PARALLEL_CHARTS", "2")))
 
 
 def compress_image(path: str, max_size_kb: int = 250) -> str:
@@ -101,7 +105,7 @@ class ChartRenderer:
         - compress ke JPEG <= max_size_kb
         """
         try:
-            async with async_playwright() as p:
+            async with _BROWSER_SLOTS, async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
 
                 context = await browser.new_context(

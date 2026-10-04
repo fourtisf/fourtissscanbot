@@ -135,6 +135,15 @@ class TelegramCryptoBot:
             name="reset_daily_stats_job"
         )
 
+        # 4️⃣ Watchdog tiap 5 menit: kalau token di-revoke atau polling berhenti,
+        # proses keluar supaya systemd me-restart bot (bukan diam berbulan-bulan).
+        self.application.job_queue.run_repeating(
+            self._health_job,
+            interval=300,
+            first=300,
+            name="health_job"
+        )
+
     async def _post_init(self, application: Application):
         """Log identitas bot & status webhook supaya masalah token/webhook langsung terlihat di log."""
         me = await application.bot.get_me()
@@ -156,6 +165,33 @@ class TelegramCryptoBot:
             logger.warning(f"⚠️ Webhook aktif ke {info.url} — polling akan menghapusnya saat start")
         if info.pending_update_count:
             logger.info(f"📥 {info.pending_update_count} pending updates")
+
+    async def _health_job(self, context: ContextTypes.DEFAULT_TYPE):
+        app = context.application
+        try:
+            await context.bot.get_me()
+        except telegram.error.InvalidToken:
+            logger.critical("❌ Token bot tidak valid/di-revoke. Update TELEGRAM_BOT_TOKEN di .env. Bot berhenti.")
+            app.stop_running()
+            return
+        except Exception as e:
+            logger.warning(f"⚠️ Health check gagal (jaringan?): {e}")
+            return
+
+        if app.updater and not app.updater.running:
+            logger.critical("❌ Polling berhenti. Keluar supaya systemd me-restart bot.")
+            app.stop_running()
+            return
+
+        # Opsional: ping monitor eksternal (mis. healthchecks.io) yang kirim alert kalau ping berhenti
+        url = os.getenv("HEALTHCHECK_URL")
+        if url:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as s:
+                    await s.get(url, timeout=aiohttp.ClientTimeout(total=10))
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal ping HEALTHCHECK_URL: {e}")
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         err = context.error
