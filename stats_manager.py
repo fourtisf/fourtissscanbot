@@ -29,24 +29,51 @@ stats = {
 
 
 # ================= Load / Save =================
+def _default_stats() -> dict:
+    return {
+        "total_users": 0,
+        "total_groups": 0,
+        "scans_today": 0,
+        "total_scans": 0,
+        "users": [],
+        "groups": [],
+        "last_reset": None,
+        "scans_by_chain": {},
+    }
+
+
+def _read_stats_file(path: str):
+    """Return dict dari file JSON, atau None kalau tidak ada / rusak."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        print(f"[WARN] {path} bukan object JSON, diabaikan")
+    except Exception as e:
+        print(f"[WARN] Gagal baca {path}: {e}")
+    return None
+
+
 def load_stats():
     global stats
-    loaded = False
-    try:
-        if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, "r") as f:
-                stats = json.load(f)
-                loaded = True
-        elif os.path.exists(BACKUP_FILE):
-            with open(BACKUP_FILE, "r") as f:
-                stats = json.load(f)
-                loaded = True
-    except Exception as e:
-        print(f"[WARN] load_stats gagal: {e}")
-        if os.path.exists(BACKUP_FILE):
-            with open(BACKUP_FILE, "r") as f:
-                stats = json.load(f)
-                loaded = True
+    data = _read_stats_file(STATS_FILE)
+    if data is None:
+        data = _read_stats_file(BACKUP_FILE)
+    loaded = data is not None
+
+    # Lengkapi key yang hilang supaya file lama/rusak sebagian tidak bikin bot crash
+    merged = _default_stats()
+    if data:
+        merged.update(data)
+    if not isinstance(merged.get("scans_by_chain"), dict):
+        merged["scans_by_chain"] = {}
+    for key in ("users", "groups"):
+        if not isinstance(merged.get(key), list):
+            merged[key] = []
+    stats = merged
 
     # --- Data Migration and Cleanup ---
     if loaded and "scans_by_chain" in stats:
@@ -73,6 +100,8 @@ def load_stats():
             if final_chain not in cleaned_chains:
                 cleaned_chains[final_chain] = {"today": 0, "total": 0}
 
+            if not isinstance(data, dict):
+                continue
             cleaned_chains[final_chain]["today"] += data.get("today", 0)
             cleaned_chains[final_chain]["total"] += data.get("total", 0)
 

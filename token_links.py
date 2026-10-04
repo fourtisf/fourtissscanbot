@@ -1,5 +1,8 @@
 import re
 import aiohttp
+import logging
+
+logger = logging.getLogger(__name__)
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict
@@ -18,15 +21,7 @@ ETH_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 # ==== Bot trading Solana ====
-SOL_BOT_TRADING = [
-    ("AXI", "https://axiom.trade/t/{addr}/@thehooman"),
-    ("TRO", "https://t.me/paris_trojanbot?start=r-hoomancanal_{addr}"),
-    ("PHO", "https://photon-sol.tinyastro.io/@{addr}?ref=thehooman"),
-    ("GM",  "https://gmgn.ai/r/{addr}?ref=cM5FhBPV"),
-    ("BLO", "https://t.me/BloomSolana_bot?start=ref_TYDDAIKFEU_{addr}"),
-    ("MAE", "https://t.me/maestro?start=r-hoomansafe_{addr}"),
-    ("BAN", "https://t.me/BananaGun_bot?start=ref_thehooman_{addr}"),
-]
+from config import SOL_BOT_TRADING  # satu sumber: link referral fourtis
 
 
 # ============================================================
@@ -38,7 +33,8 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, timeout: int = 1
         async with session.get(url, timeout=timeout, headers=headers) as r:
             if r.status == 200:
                 return await r.json()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"fetch failed {url.split('?')[0]}: {e}")
         return None
     return None
 
@@ -131,7 +127,7 @@ async def get_token_links(address: str, chain: str = "ethereum") -> Dict[str, Op
                 if holders:
                     try:
                         result["holders"] = int(holders)
-                    except:
+                    except Exception:
                         result["holders"] = holders
 
                 # --- market cap ---
@@ -139,7 +135,7 @@ async def get_token_links(address: str, chain: str = "ethereum") -> Dict[str, Op
                 if market_cap:
                     try:
                         result["market_cap"] = float(market_cap)
-                    except:
+                    except Exception:
                         result["market_cap"] = market_cap
 
                 # --- fallback holders from explorer ---
@@ -148,7 +144,7 @@ async def get_token_links(address: str, chain: str = "ethereum") -> Dict[str, Op
                         holders_from_explorer = await get_holders_by_address(address, chain=chain)
                         if holders_from_explorer:
                             result["holders"] = holders_from_explorer
-                    except:
+                    except Exception:
                         pass
 
                 # --- pilih pair terbaik (likuiditas terbesar) ---

@@ -91,7 +91,8 @@ class ChartRenderer:
             except Exception:
                 return ""
             return output_path
-        except Exception:
+        except Exception as e:
+            logger.warning(f"chart download failed: {e}")
             return ""
 
     @staticmethod

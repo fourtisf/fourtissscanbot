@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import logging
 import asyncio
 from telegram.error import BadRequest
@@ -75,6 +76,33 @@ def get_current_time_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  # UTC-5
 
 
+OUTPUT_DIRS = ("charts", "generated_pnl")
+OUTPUT_MAX_AGE_SECONDS = 24 * 3600
+
+
+def _cleanup_output_files() -> int:
+    cutoff = time.time() - OUTPUT_MAX_AGE_SECONDS
+    removed = 0
+    for d in OUTPUT_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            path = os.path.join(d, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except OSError as e:
+                logger.warning(f"Gagal hapus {path}: {e}")
+    return removed
+
+
+async def _cleanup_output_files_job(ctx: ContextTypes.DEFAULT_TYPE):
+    removed = await asyncio.to_thread(_cleanup_output_files)
+    if removed:
+        logger.info(f"[JOB] Hapus {removed} file chart/PnL lama")
+
+
 class TelegramCryptoBot:
     """Telegram bot implementation with emoji animations for all users"""
 
@@ -133,6 +161,16 @@ class TelegramCryptoBot:
             _reset_daily_stats_job,
             time=dt_time(hour=0, minute=0, tzinfo=timezone.utc),
             name="reset_daily_stats_job"
+        )
+
+        # 5️⃣ Hapus file chart/PnL lama (> 24 jam) tiap 6 jam supaya disk tidak penuh
+        for d in OUTPUT_DIRS:
+            os.makedirs(d, exist_ok=True)
+        self.application.job_queue.run_repeating(
+            _cleanup_output_files_job,
+            interval=6 * 3600,
+            first=60,
+            name="cleanup_output_files_job"
         )
 
         # 4️⃣ Watchdog tiap 5 menit: kalau token di-revoke atau polling berhenti,
@@ -615,8 +653,8 @@ class TelegramCryptoBot:
                         logger.error(f"❌ Error in auto-save scan: {e}", exc_info=True)
 
                 asyncio.create_task(_auto_save_price_scan())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"auto-save scan setup failed: {e}")
 
             # === Check if token is major coin ===
             from main import CryptoPriceScannerBot
@@ -780,7 +818,7 @@ class TelegramCryptoBot:
             )
             try:
                 await loading_msg.edit_text(error_msg, parse_mode=ParseMode.MARKDOWN)
-            except:
+            except Exception:
                 await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
 
     async def timeframe_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -864,7 +902,7 @@ class TelegramCryptoBot:
                 try:
                     await loading_msg.edit_text(chart_message, parse_mode=ParseMode.MARKDOWN,
                                                 reply_markup=reply_markup)
-                except:
+                except Exception:
                     await update.message.reply_text(chart_message, parse_mode=ParseMode.MARKDOWN,
                                                     reply_markup=reply_markup)
 
@@ -873,7 +911,7 @@ class TelegramCryptoBot:
             error_msg = f"{emoji('cross')} **Error generating chart for:** `{escape_md(query)}`"
             try:
                 await loading_msg.edit_text(error_msg, parse_mode=ParseMode.MARKDOWN)
-            except:
+            except Exception:
                 await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str = None):

@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 import asyncio
@@ -125,7 +126,7 @@ def human_delta(ts: datetime) -> str:
     if isinstance(ts, str):
         try:
             ts = datetime.fromisoformat(ts)
-        except:
+        except Exception:
             return "unknown"
     diff = now - ts
     secs = int(diff.total_seconds())
@@ -146,7 +147,7 @@ def fmt_mc(v: Optional[float]) -> str:
         return "N/A"
     try:
         v = float(v)
-    except:
+    except Exception:
         return "N/A"
     if v >= 1e12:
         return f"${v / 1e12:.2f}T"
@@ -163,7 +164,8 @@ def fmt_mc(v: Optional[float]) -> str:
 # This module assumes your project has DexScreenerAPI and CryptoPriceScannerBot available (as in main.py)
 try:
     from main import DexScreenerAPI, CryptoPriceScannerBot, CoinMarketCapAPI
-except Exception:
+except Exception as _e:
+    logging.getLogger(__name__).error(f"pnl_manager: gagal import dari main.py, fitur PnL tidak jalan: {_e}")
     DexScreenerAPI = None
     CryptoPriceScannerBot = None
     CoinMarketCapAPI = None
@@ -199,7 +201,7 @@ async def fetch_current_mcap(query: str) -> Tuple[Optional[float], Optional[str]
                 chain = pair.get("chainId") or "unknown"
                 try:
                     mcap_val = float(fdv or 0)
-                except:
+                except Exception:
                     mcap_val = 0.0
                 return mcap_val, symbol, chain
     except Exception as e:
@@ -213,10 +215,10 @@ def _text_size(draw, text, font):
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         return bbox[2] - bbox[0], bbox[3] - bbox[1]
-    except:
+    except Exception:
         try:
             return font.getsize(text)
-        except:
+        except Exception:
             return 0, 0
 
 
@@ -224,12 +226,12 @@ def _load_font(size: int, thin: bool = False):
     if thin and os.path.exists(FONT_THIN_PATH):
         try:
             return ImageFont.truetype(FONT_THIN_PATH, size)
-        except:
+        except Exception:
             pass
     if os.path.exists(FONT_PATH):
         try:
             return ImageFont.truetype(FONT_PATH, size)
-        except:
+        except Exception:
             pass
     return ImageFont.load_default()
 
@@ -287,7 +289,7 @@ def render_pnl_image(template_path: str, token_symbol: Optional[str],
             if mcap_at_scan and current_mcap is not None:
                 pct = 0.0 if float(mcap_at_scan) == 0 else ((float(current_mcap) - float(mcap_at_scan)) / float(
                     mcap_at_scan)) * 100
-        except:
+        except Exception:
             pct = None
 
         pct_text = f"{abs(pct):.2f}%" if pct is not None else "N/A"
@@ -456,10 +458,10 @@ async def pnl_command(update, context):
     if isinstance(scanned_at, str):
         try:
             scanned_at_dt = datetime.fromisoformat(scanned_at)
-        except:
+        except Exception:
             try:
                 scanned_at_dt = datetime.strptime(scanned_at, "%Y-%m-%d %H:%M:%S.%f")
-            except:
+            except Exception:
                 scanned_at_dt = datetime.now(timezone.utc)
     else:
         scanned_at_dt = scanned_at
@@ -482,7 +484,7 @@ async def pnl_command(update, context):
             await update.message.reply_photo(photo=fh)
         try:
             os.remove(out_path)
-        except:
+        except Exception:
             pass
     except Exception as e:
         await loading.edit_text(f"❌ Error generating PNL image: {e}")
@@ -499,7 +501,7 @@ async def list_scans_command(update, context):
         if isinstance(scanned_at, str):
             try:
                 scanned_dt = datetime.fromisoformat(scanned_at)
-            except:
+            except Exception:
                 scanned_dt = scanned_at
         else:
             scanned_dt = scanned_at

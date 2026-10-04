@@ -71,7 +71,7 @@ async def fetch_current_mcap(query: str) -> Tuple[Optional[float], Optional[str]
                 chain = pair.get("chainId") or "unknown"
                 try:
                     mcap_val = float(fdv or 0)
-                except:
+                except Exception:
                     mcap_val = 0.0
                 return mcap_val, symbol, chain
     except Exception as e:

@@ -6,6 +6,9 @@ import asyncio
 import aiohttp
 from typing import Optional
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ----------------------- Async LRU Cache -----------------------
 def async_lru(ttl_seconds: int = 600):
@@ -53,7 +56,8 @@ async def get_holders_by_address(address: str, chain: str) -> Optional[int]:
             return await _holders_solscan(address)
         if chain == "tron":
             return await _holders_tronscan(address)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"holders lookup failed ({chain} {address}): {e}")
         return None
 
     return None
@@ -80,8 +84,8 @@ async def _holders_etherscan(address: str, chain_id: int, site: str) -> Optional
                                     return int(holders)
                                 except Exception:
                                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"holders request failed ({url.split('?')[0]}): {e}")
 
     # Fallback: scrape halaman explorer (tanpa key)
     try:
@@ -94,8 +98,8 @@ async def _holders_etherscan(address: str, chain_id: int, site: str) -> Optional
                         or re.search(r'"holders"\s*:\s*([0-9,]+)', text)
                     if m:
                         return int(m.group(1).replace(",", ""))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"holders request failed ({url.split('?')[0]}): {e}")
 
     return None
 
@@ -113,8 +117,8 @@ async def _holders_solscan(address: str) -> Optional[int]:
                             return int(holders)
                         except Exception:
                             pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"holders request failed ({url.split('?')[0]}): {e}")
     return None
 
 # ----------------------- Tron: Tronscan helpers -----------------------
@@ -131,6 +135,6 @@ async def _holders_tronscan(address: str) -> Optional[int]:
                             return int(holders)
                         except Exception:
                             pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"holders request failed ({url.split('?')[0]}): {e}")
     return None
