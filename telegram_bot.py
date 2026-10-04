@@ -51,6 +51,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# httpx mencatat setiap request ke Telegram (tiap ~10 detik) lengkap dengan token bot di URL.
+# Cukup tampilkan warning/error saja.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 ADMINS = [1322401802, 7176469093]  # replace with your Telegram IDs
 admin_report_manager = AdminReportManager(admin_ids=[1322401802, 7176469093])
