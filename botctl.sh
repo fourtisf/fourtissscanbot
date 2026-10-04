@@ -12,7 +12,7 @@
 set -euo pipefail
 
 SERVICE=fourtisbot
-BOT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+BOT_DIR="${BOT_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)}"
 BACKUP_ROOT="$HOME/bot-backups"
 # File data yang TIDAK ada di git dan tidak boleh hilang saat deploy
 DATA_FILES=(.env stats.json stats_backup.json scans.db promo.json)
