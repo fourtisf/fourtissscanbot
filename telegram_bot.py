@@ -6,7 +6,7 @@ from telegram.error import BadRequest
 from datetime import datetime, timezone, time as dt_time
 from globals import admin_manager, ADMIN_IDS
 from leaderboard import leaderboard_command
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (ApplicationBuilder, Application, CommandHandler, CallbackQueryHandler, MessageHandler)
 from telegram.ext import ContextTypes, filters
 from telegram.constants import ParseMode
@@ -139,6 +139,18 @@ class TelegramCryptoBot:
         """Log identitas bot & status webhook supaya masalah token/webhook langsung terlihat di log."""
         me = await application.bot.get_me()
         logger.info(f"✅ Logged in as @{me.username} (id={me.id})")
+
+        # Menu "/" di Telegram: hanya command yang benar-benar ada handler-nya.
+        # Command admin & /scan, /status tetap jalan, hanya tidak ditampilkan di menu.
+        await application.bot.set_my_commands([
+            BotCommand("start", "Main menu"),
+            BotCommand("c", "Token chart: /c <address or $symbol>"),
+            BotCommand("pnl", "PnL of your scanned tokens"),
+            BotCommand("scans", "Your scan history"),
+            BotCommand("lb", "Scan leaderboard"),
+            BotCommand("fearindex", "BTC Fear & Greed Index"),
+            BotCommand("help", "How to use the bot"),
+        ])
         info = await application.bot.get_webhook_info()
         if info.url:
             logger.warning(f"⚠️ Webhook aktif ke {info.url} — polling akan menghapusnya saat start")
