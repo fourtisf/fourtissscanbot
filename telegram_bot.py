@@ -795,7 +795,7 @@ class TelegramCryptoBot:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            if chart_type in ["MAJOR_COIN_CHART", "NO_DATA", "ERROR"]:
+            if chart_type in ["MAJOR_COIN_CHART", "PUMPFUN_CHART", "NO_DATA", "ERROR"]:
                 # Just text, no image
                 await loading_msg.edit_text(
                     caption,

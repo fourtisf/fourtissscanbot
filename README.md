@@ -25,6 +25,21 @@ cp .env.example .env
 python telegram_bot.py
 ```
 
+## Token pump.fun
+
+Coin pump.fun yang masih di bonding curve sering belum di-index DexScreener
+(dulu hasilnya "No results found"). Kalau DexScreener tidak menemukan alamat
+Solana, bot otomatis mengambil data dari pump.fun (`pumpfun_api.py`):
+
+1. **API pump.fun** (`frontend-api-v3.pump.fun`) — nama, MC, ATH, sosial.
+   API ini tidak resmi dan di belakang Cloudflare, jadi bisa menolak IP server.
+2. **Fallback on-chain** — membaca akun bonding curve langsung lewat Solana RPC
+   (`SOL_RPC`, atau Helius via `HELIUS_API_KEY`, atau RPC publik). Report
+   ditandai `Source: on-chain bonding curve` dan tanpa ATH/sosial.
+
+Berlaku juga untuk tombol Chart (link ke chart pump.fun), `/scan`, `/pnl`, dan
+leaderboard. Cek log `[pump.fun]` kalau datanya tidak muncul.
+
 ## Produksi (WAJIB pakai supervisor)
 
 Jangan jalankan `python telegram_bot.py` langsung di SSH — begitu sesi ditutup

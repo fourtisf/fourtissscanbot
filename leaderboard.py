@@ -17,6 +17,7 @@ from urllib.parse import quote
 from main import DexScreenerAPI, CryptoPriceScannerBot
 from bot_config import Config
 from token_links import get_token_links
+from pumpfun_api import get_pumpfun_token
 
 
 # FUNGSI CUSTOM ESCAPE
@@ -52,10 +53,11 @@ def list_scans_for_leaderboard(since_date: datetime, chat_id: int):
             (since_date.isoformat(), chat_id)).fetchall()
 
 
-# === DEXSCREENER ONLY ===
+# === DEXSCREENER (+ fallback pump.fun) ===
 async def fetch_current_mcap(query: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     """
-    Hanya ambil data dari DexScreener.
+    Ambil data dari DexScreener; coin pump.fun yang belum di-index DexScreener
+    diambil dari pump.fun (supaya scan-nya tetap masuk leaderboard).
     Return (mcap_usd, token_symbol, chain_id) atau (None,None,None) kalau gagal.
     """
     try:
@@ -63,6 +65,10 @@ async def fetch_current_mcap(query: str) -> Tuple[Optional[float], Optional[str]
             async with DexScreenerAPI() as api:
                 results = await api.search_token(query)
                 if not results:
+                    pump_token = await get_pumpfun_token(query)
+                    if pump_token and pump_token.get("market_cap_usd"):
+                        return (float(pump_token["market_cap_usd"]),
+                                pump_token.get("symbol") or query, "solana")
                     return None, None, None
                 pair = results[0]
                 fdv = pair.get("fdv") or pair.get("marketCap") or pair.get("market_cap") or 0

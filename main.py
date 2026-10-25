@@ -31,6 +31,7 @@ from token_links import get_token_links
 from chart_renderer import compress_image
 from explorers import get_holders_by_address
 from chart_renderer import ChartRenderer
+from pumpfun_api import get_pumpfun_token, pumpfun_coin_url
 #from pnl_manager import save_scan_row, human_delta, fmt_mc
 
 
@@ -88,6 +89,51 @@ def compress_image(input_path, output_path, max_size=(1280, 720), quality=85):
 def escape_md2(text: str) -> str:
     escape_chars = r"_*[]()~`>#+-=|{}.!"
     return re.sub(r"([{}])".format(re.escape(escape_chars)), r"\\\1", text)
+
+
+# --- Helper report pump.fun ---
+def _md_safe(text: Optional[str], limit: int = 64) -> str:
+    """Nama/simbol token diisi bebas oleh creator: buang karakter Markdown
+    (_ * ` [ ]) dan baris baru — dipakai di dalam [link]/**bold** sehingga
+    escape tidak cukup; satu karakter liar membuat Telegram menolak pesan."""
+    cleaned = " ".join(re.sub(r"[_*`\[\]]", "", text or "").split())[:limit]
+    return cleaned or "Unknown"
+
+
+def _fmt_compact(n: float) -> str:
+    if n >= 1e9: return f"{n / 1e9:.2f}B"
+    if n >= 1e6: return f"{n / 1e6:.2f}M"
+    if n >= 1e3: return f"{n / 1e3:.2f}K"
+    return f"{n:,.2f}"
+
+
+def _fmt_price(price: Optional[float]) -> str:
+    if price is None:
+        return "N/A"
+    return f"${price:.8f}" if price < 1 else f"${price:,.2f}"
+
+
+def _time_ago(ts: Optional[float]) -> Optional[str]:
+    """Selisih waktu ringkas sejak epoch detik `ts` (mis. 1y, 3mo, 12d, 5h)."""
+    if not ts:
+        return None
+    secs = int(datetime.now().timestamp() - ts)
+    if secs < 0:
+        return None
+    days = secs // 86400
+    if days >= 365: return f"{days // 365}y"
+    if days >= 30: return f"{days // 30}mo"
+    if days > 0: return f"{days}d"
+    if secs >= 3600: return f"{secs // 3600}h"
+    return f"{secs // 60}m"
+
+
+def _pumpfun_curve_status(token: Dict) -> str:
+    if token.get("complete"):
+        return "🎓 Graduated"
+    if token.get("bonding_progress") is not None:
+        return f"{token['bonding_progress']:.1f}% bonding curve"
+    return "On bonding curve"
 
 
 def format_admin_reports(manager) -> str:
@@ -1047,6 +1093,108 @@ class CryptoPriceScannerBot:
         report = data.get(token_key)
         return report or ""
 
+    async def get_pumpfun_report(self, query: str) -> Optional[str]:
+        """
+        Report untuk coin pump.fun yang tidak ditemukan di DexScreener
+        (umumnya masih di bonding curve). None kalau bukan coin pump.fun.
+        """
+        token = await get_pumpfun_token(query)
+        if not token:
+            return None
+
+        mint = token["mint"]
+        name = _md_safe(token.get("name"))
+        symbol = _md_safe(token.get("symbol"), limit=20)
+        pump_url = pumpfun_coin_url(mint)
+        mc = token.get("market_cap_usd")
+        ath = token.get("ath_market_cap_usd")
+
+        stats = [
+            ("USD", _fmt_price(token.get("price_usd"))),
+            ("MC", f"${_fmt_compact(mc)}" if mc else "N/A"),
+        ]
+        if token.get("liquidity_usd") is not None:
+            stats.append(("LP", f"${_fmt_compact(token['liquidity_usd'])}"))
+        stats.append(("BC", _pumpfun_curve_status(token)))
+        age = _time_ago(token.get("created_timestamp"))
+        if age:
+            stats.append(("Age", age))
+        if ath:
+            details = [f"{(mc - ath) / ath * 100:+.0f}%"] if mc else []
+            since_ath = _time_ago(token.get("ath_timestamp"))
+            if since_ath:
+                details.append(since_ath)
+            ath_text = f"${_fmt_compact(ath)}" + (f" ({' / '.join(details)})" if details else "")
+        else:
+            ath_text = "N/A"
+        stats.append(("ATH", ath_text))
+
+        # --- Build report (format sama dengan report DexScreener) ---
+        report = (
+            f"🔸 [{name}]({pump_url}) (${symbol})\n"
+            f"├ `{mint}`\n"
+            f"└ #{CryptoBotConfig.BLOCKCHAINS['solana']['name']} || 💊 pump.fun\n\n"
+            f"📊 Token Stats\n"
+        )
+        for i, (label, value) in enumerate(stats):
+            branch = "└" if i == len(stats) - 1 else "├"
+            report += f" {branch} `{label}`:{' ' * (5 - len(label))}{value}\n"
+        report += "\n"
+
+        # --- Links ---
+        link_items = []
+        if token.get("website"): link_items.append(f"[WEB]({token['website']})")
+        if token.get("twitter"): link_items.append(f"[𝕏]({token['twitter']})")
+        if token.get("telegram"): link_items.append(f"[TG]({token['telegram']})")
+        link_items.append(f"[PUMP]({pump_url})")
+        link_items.append(f"[EXP](https://solscan.io/token/{mint})")
+        if token.get("creator"): link_items.append(f"[DEV](https://solscan.io/account/{token['creator']})")
+        report += f"🔗 Links\n└ " + " • ".join(link_items) + "\n\n"
+
+        if token.get("source") != "pump.fun API":
+            report += f"ℹ️ Source: {token.get('source')} (pump.fun API unavailable)\n\n"
+
+        # --- Bot trading links ---
+        bot_trading_links = [
+            f"[{bot_name}]({url.format(addr=mint)})"
+            for bot_name, url in SOL_BOT_TRADING
+        ]
+        report += "🤖\n"
+        report += f"└ {' • '.join(bot_trading_links)}\n"
+
+        # --- Random CTA ---
+        bot_name, bot_text, bot_url = random.choice(self.BOT_CTA_LIST)
+        report += f"\n[{bot_text}]({bot_url.format(addr=mint)})\n"
+
+        # --- Global promos ---
+        from promo_manager import get_custom_report
+        global_promos = await get_custom_report()
+        if global_promos:
+            report += f"\n🔔 PROMO:\n{global_promos}\n"
+
+        return report
+
+    async def get_pumpfun_chart_caption(self, query: str, timeframe: str) -> Optional[str]:
+        """Caption chart untuk coin pump.fun (tanpa screenshot — chart
+        DexScreener tidak ada untuk coin yang belum di-index)."""
+        token = await get_pumpfun_token(query)
+        if not token:
+            return None
+
+        CE = Config.CUSTOM_EMOJI_IDS
+        mc = token.get("market_cap_usd")
+        mc_text = f"${_fmt_compact(mc)}" if mc else "N/A"
+        symbol = _md_safe(token.get("symbol"), limit=20)
+        return (
+            f"{CE['chart']['char']} **{symbol} Chart — {timeframe.upper()}** • "
+            f"{CryptoBotConfig.BLOCKCHAINS['solana']['name']}\n\n"
+            f"{CE['money']['char']} **Price:** {_fmt_price(token.get('price_usd'))}\n"
+            f"{CE['bank']['char']} **MC:** {mc_text}\n"
+            f"{CE['rocket']['char']} **Bonding Curve:** {_pumpfun_curve_status(token)}\n"
+            f"{CE['memo']['char']} **Contract:** `{token['mint']}`\n\n"
+            f"{CE['chart_up']['char']} **Interactive Chart:** [Open on pump.fun]({pumpfun_coin_url(token['mint'])})\n"
+        )
+
     async def search_token_price(self, query: str) -> Tuple[str, str, Optional[str]]:
         CE = Config.CUSTOM_EMOJI_IDS
         query_lower = query.lower().strip()
@@ -1161,6 +1309,11 @@ class CryptoPriceScannerBot:
             async with DexScreenerAPI() as api:
                 results = await api.search_token(query)
                 if not results:
+                    # Coin pump.fun yang masih di bonding curve sering belum
+                    # di-index DexScreener → ambil langsung dari pump.fun.
+                    pump_report = await self.get_pumpfun_report(query)
+                    if pump_report:
+                        return (pump_report, query, "solana")
                     # ✅ PERBAIKAN: Mengembalikan tuple saat tidak ditemukan
                     return (f"{CE['cross']['char']} No results found for `{query}`", query, None)
 
@@ -1346,6 +1499,9 @@ class CryptoPriceScannerBot:
             async with DexScreenerAPI() as api:
                 results = await api.search_token(query)
                 if not results:
+                    pump_caption = await self.get_pumpfun_chart_caption(query, timeframe)
+                    if pump_caption:
+                        return pump_caption, "PUMPFUN_CHART", ""
                     return f"{CE['cross']['char']} **No chart data found for:** `{query}`", "NO_DATA", ""
 
                 token = results[0]
@@ -1614,7 +1770,7 @@ async def handle_chart_button(token: str, timeframe: str, query, context):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        if chart_type in ["MAJOR_COIN_CHART", "NO_DATA", "ERROR"]:
+        if chart_type in ["MAJOR_COIN_CHART", "PUMPFUN_CHART", "NO_DATA", "ERROR"]:
             await loading_msg.edit_text(
                 caption,
                 parse_mode=ParseMode.MARKDOWN,

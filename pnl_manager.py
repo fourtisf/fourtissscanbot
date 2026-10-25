@@ -180,6 +180,7 @@ except Exception:
     DexScreenerAPI = None
     CryptoPriceScannerBot = None
     CoinMarketCapAPI = None
+from pumpfun_api import get_pumpfun_token
 
 
 async def fetch_current_mcap(query: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
@@ -202,6 +203,12 @@ async def fetch_current_mcap(query: str) -> Tuple[Optional[float], Optional[str]
                 results = await api.search_token(query)
                 print(f"DEBUG: DexScreener API results for '{query}': {results}") # BARIS INI DITAMBAHKAN
                 if not results:
+                    # Coin pump.fun di bonding curve belum tentu ada di
+                    # DexScreener — tanpa fallback ini scan/PnL-nya tidak tersimpan.
+                    pump_token = await get_pumpfun_token(query)
+                    if pump_token and pump_token.get("market_cap_usd"):
+                        return (float(pump_token["market_cap_usd"]),
+                                pump_token.get("symbol") or query, "solana")
                     return None, None, None
                 # choose first pair
                 pair = results[0]
