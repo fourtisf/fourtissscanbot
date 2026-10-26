@@ -1,23 +1,41 @@
 // PM2 config untuk FourtisScanBot.
 //
-// Pemakaian (dari dalam folder bot):
+// Deploy / update (cara yang disarankan — backup, update, restart, rollback otomatis):
+//   bash /root/botscan/deploy.sh
+//
+// Manual (dari dalam folder bot):
 //   pm2 start ecosystem.config.js
 //   pm2 save
 //
 // CATATAN: pilih HANYA SATU process manager. Kalau pakai PM2, JANGAN
 // sekaligus pakai systemd untuk bot yang sama — dua-duanya jalan = dua
-// instance = error "Conflict" dari Telegram = bot mati.
+// instance = error "Conflict" dari Telegram = bot mati. deploy.sh otomatis
+// mematikan unit systemd lama saat pindah ke PM2.
+const fs = require("fs");
+const path = require("path");
+
+// Interpreter Python: BOT_PYTHON (diisi deploy.sh) → venv di folder bot → python3.
+function pickPython() {
+  if (process.env.BOT_PYTHON) return process.env.BOT_PYTHON;
+  for (const dir of ["venv", ".venv"]) {
+    const candidate = path.join(__dirname, dir, "bin", "python");
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return "python3";
+}
+
 module.exports = {
   apps: [
     {
       name: "botscan",
-      script: "telegram_bot.py",
+      script: path.join(__dirname, "telegram_bot.py"),
+      interpreter: pickPython(),
 
-      // Interpreter Python dari virtualenv (sesuaikan kalau path venv beda).
-      interpreter: "./venv/bin/python",
+      // Jalankan dari folder tempat file ini berada (folder bot).
+      cwd: __dirname,
 
-      // Jalankan dari folder bot.
-      cwd: "/root/botscan",
+      // Tanpa ini output print() Python tertahan buffer dan telat muncul di pm2 logs.
+      env: { PYTHONUNBUFFERED: "1" },
 
       // Auto-restart kalau proses mati.
       autorestart: true,

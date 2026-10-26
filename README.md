@@ -40,10 +40,52 @@ Solana, bot otomatis mengambil data dari pump.fun (`pumpfun_api.py`):
 Berlaku juga untuk tombol Chart (link ke chart pump.fun), `/scan`, `/pnl`, dan
 leaderboard. Cek log `[pump.fun]` kalau datanya tidak muncul.
 
+## Deploy ke server (setelah merge ke `main`)
+
+Satu perintah — backup data, ambil kode `main` terbaru, tes, restart di PM2,
+dan **rollback otomatis** kalau bot tidak sehat:
+
+```bash
+bash /root/botscan/deploy.sh
+```
+
+Pertama kali saja (folder server belum punya `deploy.sh`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fourtisf/fourtissscanbot/main/deploy.sh -o /tmp/deploy.sh
+bash /tmp/deploy.sh /root/botscan
+```
+
+Deploy pertama juga memindahkan bot dari systemd (mis. `fourtisbot.service`)
+ke PM2 — unit systemd lama otomatis di-stop & di-disable supaya tidak ada dua
+instance — dan mengaktifkan PM2 auto-start saat reboot. Setelah itu:
+
+```bash
+pm2 list                 # status bot
+pm2 logs botscan         # log live
+bash /root/botscan/deploy.sh --force   # restart paksa walau sudah versi terbaru
+```
+
+Yang dijaga `deploy.sh`:
+- `.env`, `scans.db`, `stats*.json`, `promo.json` di-backup ke
+  `~/botscan-deploy-backups/` dan tidak pernah tertimpa/terhapus git.
+- Kode baru yang gagal di-import → batal, bot yang sedang jalan tidak disentuh.
+- Bot crash / 409 Conflict / gagal login setelah restart → kode dan supervisor
+  dikembalikan ke kondisi sebelum deploy.
+- Ada edit manual di file kode di server → deploy berhenti tanpa menghapusnya.
+
 ## Produksi (WAJIB pakai supervisor)
 
 Jangan jalankan `python telegram_bot.py` langsung di SSH — begitu sesi ditutup
-atau proses crash sekali, bot mati permanen. Pakai systemd:
+atau proses crash sekali, bot mati permanen. Supervisor yang dipakai: **PM2**
+(dipasang otomatis oleh `deploy.sh`, lihat di atas).
+
+**Hanya boleh ada SATU instance bot yang polling.** Dua instance (atau orang
+lain yang memegang token) menyebabkan error `409 Conflict` dan bot berhenti
+menerima pesan tanpa crash — terlihat hidup tapi tidak menjawab. **Pilih SATU
+supervisor saja** (PM2 **atau** systemd **atau** `run_bot.sh`), jangan dua-duanya.
+
+### Alternatif supervisor: systemd
 
 ```bash
 sudo cp deploy/fourtissscanbot.service /etc/systemd/system/
@@ -53,18 +95,7 @@ sudo systemctl enable --now fourtissscanbot
 journalctl -u fourtissscanbot -f   # lihat log
 ```
 
-**Hanya boleh ada SATU instance bot yang polling.** Dua instance (atau orang
-lain yang memegang token) menyebabkan error `409 Conflict` dan bot berhenti
-menerima pesan tanpa crash — terlihat hidup tapi tidak menjawab. **Pilih SATU
-supervisor saja** (PM2 **atau** systemd **atau** `run_bot.sh`), jangan dua-duanya.
-
-### Alternatif supervisor: PM2
-
-```bash
-pm2 start ecosystem.config.js   # atau: pm2 restart botscan (kalau sudah ada)
-pm2 save                        # supaya nyala lagi otomatis saat reboot
-pm2 logs botscan
-```
+Kalau pakai systemd, jangan pakai `deploy.sh` (script itu memindahkan bot ke PM2).
 
 ## 🛡️ Ketahanan otomatis (sudah terpasang)
 
@@ -82,7 +113,9 @@ pm2 logs botscan
 Branch ini MENGHAPUS `.env`, `scans.db`, `stats.json`, `stats_backup.json`,
 `charts/`, dan `generated_pnl/` dari git (file-file ini sekarang di-ignore).
 `git pull` pertama akan **menghapus file-file itu dari server** (atau konflik
-kalau ada perubahan lokal). Lakukan ini SEKALI sebelum pull:
+kalau ada perubahan lokal). `deploy.sh` sudah menangani ini otomatis
+(backup → update → pulihkan). Kalau update manual tanpa `deploy.sh`, lakukan
+ini SEKALI sebelum pull:
 
 ```bash
 sudo systemctl stop fourtissscanbot          # atau matikan proses bot
