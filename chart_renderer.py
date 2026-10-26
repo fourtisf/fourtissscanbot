@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 
 # Batasi jumlah Chromium yang jalan bersamaan — tiap instance makan ratusan MB
 # RAM; tanpa batas ini beberapa request chart bersamaan bisa memicu OOM kill.
-_RENDER_SEMAPHORE = asyncio.Semaphore(2)
+# Bisa diatur lewat MAX_PARALLEL_CHARTS di .env (default 2).
+_max_charts = (os.getenv("MAX_PARALLEL_CHARTS") or "").strip()
+_RENDER_SEMAPHORE = asyncio.Semaphore(max(1, int(_max_charts)) if _max_charts.isdigit() else 2)
 
 
 def compress_image(path: str, max_size_kb: int = 250) -> str:
@@ -97,7 +99,8 @@ class ChartRenderer:
             except Exception:
                 return ""
             return output_path
-        except Exception:
+        except Exception as e:
+            logger.warning(f"chart download failed: {e}")
             return ""
 
     @staticmethod

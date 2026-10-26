@@ -58,12 +58,18 @@ bash /tmp/deploy.sh /root/botscan
 
 Deploy pertama juga memindahkan bot dari systemd (mis. `fourtisbot.service`)
 ke PM2 — unit systemd lama otomatis di-stop & di-disable supaya tidak ada dua
-instance — dan mengaktifkan PM2 auto-start saat reboot. Setelah itu:
+instance — dan mengaktifkan PM2 auto-start saat reboot.
+
+Perintah singkat `bot` (pasang sekali: `ln -sf /root/botscan/botctl.sh /usr/local/bin/bot`,
+atau `bash botctl.sh install` di server baru):
 
 ```bash
-pm2 list                 # status bot
-pm2 logs botscan         # log live
-bash /root/botscan/deploy.sh --force   # restart paksa walau sudah versi terbaru
+bot deploy     # = bash /root/botscan/deploy.sh
+bot rollback   # kembali ke versi sebelum deploy terakhir
+bot status     # = pm2 list
+bot logs       # = pm2 logs botscan
+bot restart    # = pm2 restart botscan
+bot stop       # = pm2 stop botscan
 ```
 
 Yang dijaga `deploy.sh`:
@@ -73,6 +79,8 @@ Yang dijaga `deploy.sh`:
 - Bot crash / 409 Conflict / gagal login setelah restart → kode dan supervisor
   dikembalikan ke kondisi sebelum deploy.
 - Ada edit manual di file kode di server → deploy berhenti tanpa menghapusnya.
+- Sebelum restart, `tests/smoke_test.py` menjalankan bot asli melawan Telegram
+  palsu (`/start`, `/help`, scan contract) — kode yang rusak tidak pernah live.
 
 ## Produksi (WAJIB pakai supervisor)
 

@@ -36,5 +36,6 @@ scans.db
 scans.db-journal
 stats.json
 stats_backup.json
+promo.json
 charts/
 generated_pnl/

@@ -5,6 +5,7 @@
 #
 #   bash /root/botscan/deploy.sh            # deploy versi terbaru
 #   bash /root/botscan/deploy.sh --force    # restart walau sudah versi terbaru
+#   bash /root/botscan/deploy.sh --rollback # kembali ke versi sebelum deploy terakhir
 #
 # Pertama kali (folder bot belum punya deploy.sh):
 #   curl -fsSL https://raw.githubusercontent.com/fourtisf/fourtissscanbot/main/deploy.sh -o /tmp/deploy.sh
@@ -14,8 +15,9 @@
 #   1. Backup data runtime (.env, scans.db, stats*.json, promo.json) ke luar repo.
 #   2. Ambil kode branch main. Folder yang belum berupa git repo dikonversi
 #      sekali (dengan backup penuh .tgz).
-#   3. Install requirements kalau berubah, lalu tes kode bisa di-import.
-#      Gagal → kode dikembalikan, bot yang sedang jalan TIDAK disentuh.
+#   3. Install requirements kalau berubah, lalu tes kode (import + smoke test
+#      bot melawan Telegram palsu). Gagal → kode dikembalikan, bot yang sedang
+#      jalan TIDAK disentuh.
 #   4. Pindahkan bot dari systemd ke PM2 (sekali saja). Dua supervisor = dua
 #      instance = 409 Conflict dari Telegram = bot diam.
 #   5. Health check. Bot tidak sehat → rollback otomatis ke kondisi sebelum
@@ -37,10 +39,12 @@ RUNTIME_FILES=(.env scans.db stats.json stats_backup.json promo.json)
 # jadi aman walau deploy.sh sendiri ikut ter-update oleh git di tengah jalan.
 main() {
     local force=0 dir_arg=""
+    ROLLBACK=0
     for arg in "$@"; do
         case "$arg" in
             --force) force=1 ;;
-            -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}"; exit 0 ;;
+            --rollback) ROLLBACK=1 ;;
+            -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}"; exit 0 ;;
             *) dir_arg="$arg" ;;
         esac
     done
@@ -71,11 +75,21 @@ main() {
     if [ "$(git rev-parse --show-toplevel 2>/dev/null || true)" = "$BOT_DIR" ]; then
         is_repo=1
         git remote get-url origin >/dev/null 2>&1 || git remote add origin "$REPO_URL"
-        log "Ambil kode terbaru branch $BRANCH dari GitHub..."
-        git fetch -q origin "$BRANCH" \
-            || die "git fetch gagal dari $(git remote get-url origin) (cek koneksi internet server)."
-        NEW="$(git rev-parse FETCH_HEAD)"
         OLD="$(git rev-parse -q --verify HEAD || true)"
+        if [ "$ROLLBACK" = 1 ]; then
+            NEW="$(rollback_target)"
+            [ -n "$NEW" ] || die "Tidak ada versi sebelumnya untuk rollback (belum pernah deploy dengan deploy.sh)."
+            # Versi tanpa deploy.sh belum kenal PM2 (botctl.sh lamanya me-restart
+            # systemd → dua instance → 409). Jangan rollback ke sana.
+            git cat-file -e "$NEW:deploy.sh" 2>/dev/null \
+                || die "Versi sebelumnya ($(git log -1 --format='%h' "$NEW")) belum mendukung PM2/deploy.sh — tidak bisa rollback ke sana."
+            log "Rollback ke versi sebelum deploy terakhir: $(git log -1 --format='%h %s' "$NEW")"
+        else
+            log "Ambil kode terbaru branch $BRANCH dari GitHub..."
+            git fetch -q origin "$BRANCH" \
+                || die "git fetch gagal dari $(git remote get-url origin) (cek koneksi internet server)."
+            NEW="$(git rev-parse FETCH_HEAD)"
+        fi
         cur_branch="$(git symbolic-ref --short -q HEAD || true)"
         ORIG_BRANCH="$cur_branch"
         ORIG_MAIN="$(git rev-parse -q --verify "refs/heads/$BRANCH" || true)"
@@ -83,6 +97,7 @@ main() {
             CODE_CHANGED=1
         fi
     else
+        [ "$ROLLBACK" = 0 ] || die "Folder ini belum pernah di-deploy dengan deploy.sh — tidak ada versi untuk rollback."
         CODE_CHANGED=1
     fi
 
@@ -99,8 +114,15 @@ main() {
         exit 0
     fi
 
-    BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$BACKUP_ROOT"
+    # Prefix waktu → urutan kronologis; suffix acak → dua deploy di detik yang
+    # sama tidak saling menimpa backup.
+    BACKUP_DIR="$(mktemp -d "$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-XXXX")"
+    # Commit sebelum deploy dicatat untuk --rollback. Backup milik rollback
+    # sendiri tidak dicatat, supaya rollback berulang terus mundur (tidak bolak-balik).
+    if [ -n "$OLD" ] && [ "$ROLLBACK" = 0 ]; then
+        echo "$OLD" >"$BACKUP_DIR/COMMIT"
+    fi
     backup_runtime
 
     # --- Update kode ---
@@ -155,7 +177,9 @@ main() {
 
     echo
     log "✅ Deploy berhasil."
-    if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+    if [ "$ROLLBACK" = 1 ]; then
+        log "Rollback: ${OLD:0:7} → ${NEW:0:7}. Deploy versi terbaru lagi: bash $BOT_DIR/deploy.sh"
+    elif [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
         log "Perubahan yang ter-deploy:"
         git log --oneline "$OLD..$NEW" | head -20 | sed 's/^/     /'
     fi
@@ -345,9 +369,17 @@ update_git() {
       • buang perubahan lokal : cd $BOT_DIR && git checkout -- ${dirty[*]}
       • atau commit perubahan itu ke GitHub dulu, lalu deploy lagi."
     fi
-    if git show-ref -q --verify "refs/heads/$BRANCH" && ! git merge-base --is-ancestor "$BRANCH" "$NEW"; then
-        restore_runtime "$OLD"
-        die "Branch $BRANCH lokal punya commit yang tidak ada di GitHub. Selesaikan manual dulu."
+    if git show-ref -q --verify "refs/heads/$BRANCH"; then
+        # Maju: main lokal harus ancestor versi baru. Mundur (rollback): main
+        # lokal tidak boleh punya commit yang belum ada di GitHub.
+        local upstream="$NEW"
+        if [ "$ROLLBACK" = 1 ]; then
+            upstream="$(git rev-parse -q --verify "refs/remotes/origin/$BRANCH" || echo "$NEW")"
+        fi
+        if ! git merge-base --is-ancestor "$BRANCH" "$upstream"; then
+            restore_runtime "$OLD"
+            die "Branch $BRANCH lokal punya commit yang tidak ada di GitHub. Selesaikan manual dulu."
+        fi
     fi
     # File runtime yang belum di-track tapi di-track di versi baru akan
     # menghalangi checkout — sudah di-backup, singkirkan sebentar.
@@ -361,6 +393,21 @@ update_git() {
     git branch -q --set-upstream-to="origin/$BRANCH" "$BRANCH" 2>/dev/null || true
     restore_runtime "$OLD" "$NEW"
     log "Kode diupdate: ${OLD:0:7} → ${NEW:0:7}"
+}
+
+# Commit sebelum deploy terakhir yang berbeda dari versi sekarang (backup terbaru dulu)
+rollback_target() {
+    local dir commit head
+    head="$(git rev-parse -q --verify HEAD || true)"
+    while read -r dir; do
+        [ -f "$dir/COMMIT" ] || continue
+        commit="$(cat "$dir/COMMIT")"
+        if [ "$commit" != "$head" ] && git cat-file -e "$commit^{commit}" 2>/dev/null; then
+            echo "$commit"
+            return 0
+        fi
+    done < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r)
+    return 0
 }
 
 pip_install() {
@@ -377,11 +424,14 @@ pip_install() {
     fi
 }
 
+# Tes sebelum bot yang sedang jalan disentuh: compile + import, lalu (kalau ada)
+# tests/smoke_test.py yang menjalankan bot asli melawan Telegram API palsu.
 smoke_test() {
     "$PY" -m py_compile ./*.py >"$BACKUP_DIR/smoke.log" 2>&1 \
         && timeout 180 "$PY" -c 'import telegram_bot
 from telegram.ext import JobQueue
-JobQueue()' >>"$BACKUP_DIR/smoke.log" 2>&1
+JobQueue()' >>"$BACKUP_DIR/smoke.log" 2>&1 \
+        && { [ ! -f tests/smoke_test.py ] || timeout 180 "$PY" tests/smoke_test.py >>"$BACKUP_DIR/smoke.log" 2>&1; }
 }
 
 # Proses bot dari folder ini yang jalan di luar PM2 (manual/nohup/run_bot.sh)
